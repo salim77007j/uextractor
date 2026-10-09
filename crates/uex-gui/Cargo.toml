@@ -1,0 +1,26 @@
+[package]
+name = "uex-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "uex-gui"
+
+[[bin]]
+name = "uex-gui"
+path = "src/main.rs"
+
+[dependencies]
+uex-core.workspace = true
+eframe.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+directories.workspace = true
+image.workspace = true
+rfd = "0.17.2"
+serde.workspace = true
+x11rb = { version = "0.14.0", features = ["image"] }
+
+[features]
+autoshot = []

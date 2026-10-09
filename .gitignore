@@ -1,0 +1,7 @@
+/target
+testdata/
+extracted/
+out*/
+*.pak
+*.utoc
+*.ucas

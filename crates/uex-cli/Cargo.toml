@@ -1,0 +1,18 @@
+[package]
+name = "uex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uex"
+path = "src/main.rs"
+
+[dependencies]
+uex-core.workspace = true
+uex-testdata.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true

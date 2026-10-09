@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/uex-core",
+    "crates/uex-testdata",
+    "crates/uex-cli",
+    "crates/uex-gui",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["UExtractor contributors"]
+
+[workspace.dependencies]
+thiserror = "2"
+anyhow = "1"
+aes = "0.8"
+flate2 = "1"
+lz4_flex = "0.11"
+ruzstd = "0.8"
+libloading = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+cityhasher = "0.1"
+byteorder = "1.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "tga", "jpeg"] }
+texture2ddecoder = "0.1"
+rayon = "1"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.32"
+directories = "6"
+uex-core = { path = "crates/uex-core" }
+uex-testdata = { path = "crates/uex-testdata" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1

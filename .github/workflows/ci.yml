@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Run unit + integration tests
+        run: cargo test --release --workspace
+
+      - name: Smoke-test CLI against synthetic archives
+        shell: bash
+        run: |
+          target/release/uex gen-testdata --out testdata --files 4 --file-mb 1
+          target/release/uex info testdata/test_plain.pak
+          target/release/uex list testdata/test_container.utoc
+          target/release/uex extract testdata/test_plain.pak --out out_plain
+          target/release/uex extract testdata/test_encrypted.pak -k 11223344556677889900AABBCCDDEEFF00112233445566778899AABBCCDDEEFF --out out_enc
+          target/release/uex extract testdata/test_container.utoc --convert auto --out out_zen
+          target/release/uex extract testdata/test_textures.pak --convert auto --out out_tex
+          target/release/uex extract testdata/test_mesh.pak --convert auto --out out_mesh
+          ls -R out_zen out_tex out_mesh
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: uextractor-${{ matrix.os }}
+          path: |
+            target/release/uex${{ runner.os == 'Windows' && '.exe' || '' }}
+            target/release/uex-gui${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p uex-cli
+      - name: Benchmark extraction throughput (no Oodle on CI without download)
+        run: |
+          target/release/uex bench --size-mb 128 --compression lz4

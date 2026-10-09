@@ -1,0 +1,31 @@
+[package]
+name = "uex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+aes.workspace = true
+flate2.workspace = true
+lz4_flex.workspace = true
+ruzstd.workspace = true
+libloading.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hex.workspace = true
+cityhasher.workspace = true
+byteorder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+texture2ddecoder.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+memmap2.workspace = true
+log.workspace = true
+directories.workspace = true
+
+[dev-dependencies]
+uex-testdata.workspace = true
