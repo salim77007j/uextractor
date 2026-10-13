@@ -4,6 +4,8 @@
 
 use std::io::Write;
 
+pub mod unity;
+
 pub const TEST_AES_KEY: &str = "0x11223344556677889900AABBCCDDEEFF00112233445566778899AABBCCDDEEFF";
 
 pub struct SampleFile {

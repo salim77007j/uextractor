@@ -1,17 +1,20 @@
-//! Application state and UI layout.
+//! Application state and business logic. Rendering lives in `ui.rs`.
 
 use crossbeam_channel::Receiver;
 use eframe::egui;
-use egui::{Color32, RichText};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uex_core::crypto::AesKey;
-use uex_core::mount::{Mount, VirtualFile};
+pub use uex_core::mount::VirtualFile;
+use uex_core::mount::Mount;
 use uex_core::pipeline::ProgressEvent;
 
+use crate::theme::ic;
+
 // ---------------------------------------------------------------------------
-// persistence
+// persistence (same schema as v1.0 — existing configs keep working)
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Persisted {
@@ -24,19 +27,19 @@ struct Persisted {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct KeyEntry {
-    name: String,
-    hex: String,
+pub struct KeyEntry {
+    pub name: String,
+    pub hex: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ExportFormats {
-    png: bool,
-    dds: bool,
-    glb: bool,
-    obj: bool,
-    json: bool,
-    audio: bool,
+pub struct ExportFormats {
+    pub png: bool,
+    pub dds: bool,
+    pub glb: bool,
+    pub obj: bool,
+    pub json: bool,
+    pub audio: bool,
 }
 
 impl Default for ExportFormats {
@@ -48,6 +51,13 @@ impl Default for ExportFormats {
 fn config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("org", "uextractor", "UExtractor")
         .map(|d| d.config_dir().join("config.json"))
+}
+
+fn load_persisted() -> Persisted {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -94,10 +104,26 @@ fn build_tree(files: Vec<VirtualFile>) -> Vec<TreeNode> {
     root.children.iter().map(|(n, c)| convert(c, "", n)).collect()
 }
 
+/// Keep only nodes whose own name or any descendant matches the filter.
+fn filter_tree(nodes: &mut Vec<TreeNode>, flt: &str) {
+    nodes.retain_mut(|n| {
+        if n.file.is_some() {
+            return n.name.to_lowercase().contains(flt);
+        }
+        filter_tree(&mut n.children, flt);
+        !n.children.is_empty()
+    });
+}
+
+/// Public wrapper used by the UI when rendering a filtered tree.
+pub fn filter_tree_pub(nodes: &mut Vec<TreeNode>, flt: &str) {
+    filter_tree(nodes, flt);
+}
+
 // ---------------------------------------------------------------------------
 // preview
 
-enum Preview {
+pub enum Preview {
     None,
     Texture(egui::TextureHandle),
     Mesh { mesh: uex_core::assets::mesh::ExtractedMesh, rot_x: f32, rot_y: f32, zoom: f32 },
@@ -106,43 +132,108 @@ enum Preview {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ViewMode {
+pub enum ViewMode {
     List,
     Grid,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SortCol {
+    Name,
+    Type,
+    Size,
+}
+
+// ---------------------------------------------------------------------------
+// status + key prompt
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum StatusKind {
+    Info,
+    Ok,
+    Warn,
+    Err,
+    Busy,
+}
+
+pub struct Status {
+    pub kind: StatusKind,
+    pub text: String,
+}
+
+impl Status {
+    pub fn new(kind: StatusKind, text: impl Into<String>) -> Self {
+        Self { kind, text: text.into() }
+    }
+}
+
+/// What to do after a key has been accepted.
+#[derive(Clone)]
+pub enum PendingAction {
+    Reopen(PathBuf),
+    ExtractAll,
+    ExtractSelected(VirtualFile),
+    Nothing,
+}
+
+/// Modal "AES key required" prompt, shown BEFORE any failing work happens.
+pub struct KeyPrompt {
+    pub reason: String,
+    pub guid_hint: Option<String>,
+    pub action: PendingAction,
+    pub input: String,
+    pub error: Option<String>,
+}
+
+impl KeyPrompt {
+    pub fn input_valid(hex: &str) -> bool {
+        AesKey::parse(hex).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
 
 pub struct App {
-    mount: Option<Arc<Mount>>,
-    tree: Vec<TreeNode>,
-    flat_files: Vec<VirtualFile>,
-    filter: String,
-    expanded: std::collections::HashSet<String>,
-    selected: Option<VirtualFile>,
-    preview: Preview,
-    view_mode: ViewMode,
+    pub mount: Option<Arc<Mount>>,
+    pub archive_name: String,
+    pub tree: Vec<TreeNode>,
+    pub flat_files: Vec<VirtualFile>,
+    pub filter: String,
+    pub expanded: std::collections::HashSet<String>,
+    pub selected: Option<VirtualFile>,
+    pub preview: Preview,
+    pub view_mode: ViewMode,
+    pub sort_col: SortCol,
+    pub sort_asc: bool,
 
-    keys: Vec<KeyEntry>,
-    active_key: Option<String>,
-    recent: Vec<String>,
+    pub keys: Vec<KeyEntry>,
+    pub active_key: Option<String>,
+    pub recent: Vec<String>,
 
     // extraction
-    extracting: bool,
-    progress_rx: Option<Receiver<ProgressEvent>>,
-    last_progress: Option<ProgressEvent>,
-    output_dir: String,
-    convert: bool,
-    formats: ExportFormats,
-    show_settings: bool,
-    show_keys: bool,
-    status: String,
+    pub extracting: bool,
+    pub progress_rx: Option<Receiver<ProgressEvent>>,
+    pub last_progress: Option<ProgressEvent>,
+    pub extract_cancel: Arc<AtomicBool>,
+    pub report: Option<Arc<std::sync::Mutex<uex_core::pipeline::ExtractReport>>>,
+    pub last_errors: Vec<String>,
+    pub output_dir: String,
+    pub convert: bool,
+    pub formats: ExportFormats,
+    pub show_settings: bool,
+    pub show_keys: bool,
+    pub show_errors: bool,
+    pub show_progress: bool,
+    pub status: Status,
+
+    // key prompt modal
+    pub key_prompt: Option<KeyPrompt>,
 
     // thumbnails
-    textures: HashMap<String, egui::TextureHandle>,
+    pub textures: HashMap<String, egui::TextureHandle>,
 
     // batch queue
-    queue: Vec<String>,
+    pub queue: Vec<String>,
 
     // automated screenshot mode
     pub autoshot: Option<AutoShot>,
@@ -162,19 +253,13 @@ impl Default for App {
     }
 }
 
-fn load_persisted() -> Persisted {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
 impl App {
     pub fn new() -> Self {
         let persisted = load_persisted();
         let output_dir = persisted.export_dir.clone().unwrap_or_else(|| "extracted".to_string());
         App {
             mount: None,
+            archive_name: String::new(),
             tree: Vec::new(),
             flat_files: Vec::new(),
             filter: String::new(),
@@ -182,25 +267,33 @@ impl App {
             selected: None,
             preview: Preview::None,
             view_mode: ViewMode::List,
+            sort_col: SortCol::Name,
+            sort_asc: true,
             keys: persisted.keys,
             active_key: persisted.active_key,
             recent: persisted.recent,
             extracting: false,
             progress_rx: None,
             last_progress: None,
+            extract_cancel: Arc::new(AtomicBool::new(false)),
+            report: None,
+            last_errors: Vec::new(),
             output_dir,
             convert: persisted.convert,
             formats: persisted.formats,
             show_settings: false,
             show_keys: false,
-            status: "Ready. Open a .pak / .utoc archive or drop it here.".into(),
+            show_errors: false,
+            show_progress: false,
+            status: Status::new(StatusKind::Info, "Ready — open an archive or drop it anywhere."),
             textures: HashMap::new(),
+            key_prompt: None,
             queue: Vec::new(),
             autoshot: None,
         }
     }
 
-    fn save_persisted(&self) {
+    pub fn save_persisted(&self) {
         let p = Persisted {
             recent: self.recent.clone(),
             keys: self.keys.clone(),
@@ -215,7 +308,7 @@ impl App {
         }
     }
 
-    fn resolve_key(&self) -> Option<AesKey> {
+    pub fn resolve_key(&self) -> Option<AesKey> {
         let name = self.active_key.as_ref()?;
         self.keys
             .iter()
@@ -223,18 +316,67 @@ impl App {
             .and_then(|k| AesKey::parse(&k.hex))
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    pub fn engine_badge(&self) -> Option<(&'static str, &'static str, egui::Color32)> {
+        // (glyph, label, color) — determined from loaded file paths
+        let files = &self.flat_files;
+        if files.is_empty() {
+            return None;
+        }
+        let any = |exts: &[&str]| {
+            files.iter().any(|f| {
+                let l = f.path.to_lowercase();
+                exts.iter().any(|e| l.ends_with(e) || l.contains(e))
+            })
+        };
+        if any(&[".pak", ".utoc", ".ucas", ".uasset", ".uexp", ".ubulk"]) {
+            Some((ic::UNREAL, "Unreal Engine", crate::theme::Palette::ACCENT))
+        } else if any(&[".bundle", ".unity3d", ".assets", "sharedassets", "level0", ".ress", ".resource", "cab-"]) {
+            Some((ic::UNITY, "Unity", crate::theme::Palette::MAGENTA))
+        } else {
+            None
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // archive open
+
+    pub fn open_path(&mut self, path: PathBuf) {
         match Mount::open(&path, self.resolve_key()) {
             Ok(mount) => {
                 let mount = Arc::new(mount);
                 self.flat_files = mount.files().cloned().collect();
+                self.archive_name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
                 self.tree = build_tree(self.flat_files.clone());
-                self.status = format!(
-                    "Loaded {} ({} files, {:.1} MB)",
-                    path.display(),
-                    self.flat_files.len(),
-                    mount.total_size as f64 / 1048576.0
+                // auto-expand top-level folders
+                self.expanded.clear();
+                for node in &self.tree {
+                    if !node.children.is_empty() {
+                        self.expanded.insert(node.full_path.clone());
+                    }
+                }
+                self.status = Status::new(
+                    StatusKind::Ok,
+                    format!(
+                        "Loaded {} — {} files, {}",
+                        self.archive_name,
+                        self.flat_files.len(),
+                        format_size(mount.total_size)
+                    ),
                 );
+                if mount.encrypted_file_count() > 0 {
+                    self.status = Status::new(
+                        StatusKind::Warn,
+                        format!(
+                            "Loaded {} — {} files ({} AES-encrypted: a key will be requested before extraction)",
+                            self.archive_name,
+                            self.flat_files.len(),
+                            mount.encrypted_file_count()
+                        ),
+                    );
+                }
                 let rec = path.display().to_string();
                 self.recent.retain(|r| r != &rec);
                 self.recent.insert(0, rec);
@@ -242,15 +384,46 @@ impl App {
                 self.mount = Some(mount);
                 self.preview = Preview::None;
                 self.selected = None;
+                self.textures.clear();
                 self.save_persisted();
             }
             Err(e) => {
-                self.status = format!("Failed to open {}: {e}", path.display());
+                // The most common failure: archive needs a key to even open.
+                let text = e.to_string();
+                if matches!(e, uex_core::error::Error::EncryptedNoKey)
+                    || text.contains("key is most likely WRONG")
+                {
+                    self.key_prompt = Some(KeyPrompt {
+                        reason: format!(
+                            "{} is AES-encrypted (its index can only be read with the game's key).{}\nEnter the 64-character hex key to open this archive.",
+                            path.file_name().and_then(|s| s.to_str()).unwrap_or("This archive"),
+                            if text.contains("WRONG") {
+                                "\nThe key that was loaded did NOT work — it belongs to a different game."
+                            } else {
+                                ""
+                            }
+                        ),
+                        guid_hint: None,
+                        action: PendingAction::Reopen(path.clone()),
+                        input: String::new(),
+                        error: None,
+                    });
+                    self.status = Status::new(
+                        StatusKind::Warn,
+                        if text.contains("WRONG") {
+                            "Wrong AES key — enter the correct key."
+                        } else {
+                            "Archive is encrypted — AES key required."
+                        },
+                    );
+                } else {
+                    self.status = Status::new(StatusKind::Err, format!("Failed to open {}: {e}", path.display()));
+                }
             }
         }
     }
 
-    fn filtered_files(&self) -> Vec<&VirtualFile> {
+    pub fn filtered_files(&self) -> Vec<&VirtualFile> {
         let flt = self.filter.to_lowercase();
         self.flat_files
             .iter()
@@ -259,50 +432,259 @@ impl App {
             .collect()
     }
 
-    fn extract(&mut self, selection: Option<Vec<&VirtualFile>>) {
-        let Some(mount) = self.mount.clone() else { return };
-        let out = PathBuf::from(&self.output_dir);
-        let threads = 0;
-        let convert = self.convert;
-        std::fs::create_dir_all(&out).ok();
-
-        // Build a temporary Mount-like view: we reuse the pipeline by planning over all
-        // files then filtering; selection case handled through a custom plan closure.
-        let opts = uex_core::pipeline::ExtractOptions {
-            filter: None,
-            extensions: Vec::new(),
-            output_dir: out,
-            threads,
-            convert,
-            ..Default::default()
-        };
-        let (rx, _report) = uex_core::pipeline::extract_parallel(&mount, &opts);
-        self.extracting = true;
-        self.progress_rx = Some(rx);
-        self.last_progress = None;
-        let _ = selection;
-        self.status = "Extracting...".into();
+    /// Sorted + filtered view for the asset table.
+    pub fn table_files(&mut self) -> Vec<VirtualFile> {
+        let mut files: Vec<VirtualFile> = self
+            .filtered_files()
+            .into_iter()
+            .cloned()
+            .collect();
+        let lower_type = |p: &str| type_icon(p).0.to_string();
+        match self.sort_col {
+            SortCol::Name => files.sort_by(|a, b| a.path.cmp(&b.path)),
+            SortCol::Size => files.sort_by_key(|f| f.size),
+            SortCol::Type => files.sort_by(|a, b| {
+                lower_type(&a.path).cmp(&lower_type(&b.path)).then(a.path.cmp(&b.path))
+            }),
+        }
+        if !self.sort_asc {
+            files.reverse();
+        }
+        files
     }
 
-    fn update_progress(&mut self) {
+    // -----------------------------------------------------------------------
+    // extraction
+
+    /// Gate: if the archive holds encrypted payloads and no valid key is loaded,
+    /// raise the key prompt instead of starting work that would fail.
+    fn aes_gate(&mut self, action: PendingAction) -> bool {
+        let Some(mount) = self.mount.clone() else { return false };
+        let enc = mount.encrypted_file_count();
+        if enc == 0 {
+            return true;
+        }
+        match self.resolve_key() {
+            None => {
+                self.key_prompt = Some(KeyPrompt {
+                    reason: format!(
+                        "{enc} of {} files in this archive are AES-encrypted.\nExtraction would fail without the game's key. Enter the 64-character hex key now, or extract only the unencrypted files.",
+                        mount.file_count()
+                    ),
+                    guid_hint: mount.encryption_key_guids().first().cloned(),
+                    action,
+                    input: String::new(),
+                    error: None,
+                });
+                false
+            }
+            Some(key) => match mount.test_key(&key) {
+                Ok(true) => true, // key verified against an encrypted payload
+                Ok(false) => true, // nothing probeable; proceed and let per-file errors surface
+                Err(e) => {
+                    self.key_prompt = Some(KeyPrompt {
+                        reason: format!(
+                            "The active key FAILED verification: {e}\nThe loaded key is wrong for this archive. Enter the correct 64-hex-char key, or extract only the unencrypted files."
+                        ),
+                        guid_hint: mount.encryption_key_guids().first().cloned(),
+                        action,
+                        input: String::new(),
+                        error: None,
+                    });
+                    false
+                }
+            },
+        }
+    }
+
+    pub fn extract(&mut self, selection: Option<Vec<VirtualFile>>) {
+        let action = match selection.as_deref() {
+            Some([first, ..]) => PendingAction::ExtractSelected(first.clone()),
+            _ => PendingAction::ExtractAll,
+        };
+        if !self.aes_gate(action) {
+            return;
+        }
+        self.start_extraction(selection, false);
+    }
+
+    /// Extract while skipping encrypted files (fallback offered in the key prompt).
+    pub fn extract_unencrypted_only(&mut self) {
+        self.start_extraction(None, true);
+    }
+
+    pub fn start_extraction(&mut self, selection: Option<Vec<VirtualFile>>, skip_encrypted: bool) {
+        let Some(mount) = self.mount.clone() else { return };
+        let out = PathBuf::from(&self.output_dir);
+        std::fs::create_dir_all(&out).ok();
+
+        let opts = uex_core::pipeline::ExtractOptions {
+            output_dir: out,
+            convert: self.convert,
+            skip_encrypted,
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
+        };
+        self.extract_cancel = opts.cancel.clone();
+        let (rx, report) = uex_core::pipeline::extract_parallel(&mount, &opts);
+        let _ = selection;
+        self.extracting = true;
+        self.show_progress = true;
+        self.progress_rx = Some(rx);
+        self.report = Some(report);
+        self.last_progress = None;
+        self.status = Status::new(StatusKind::Busy, "Extracting…");
+    }
+
+    pub fn cancel_extraction(&mut self) {
+        self.extract_cancel.store(true, Ordering::Relaxed);
+        self.status = Status::new(StatusKind::Warn, "Cancelling extraction…");
+    }
+
+    pub fn update_progress(&mut self) {
         if let Some(rx) = &self.progress_rx {
             while let Ok(ev) = rx.try_recv() {
                 if ev.finished {
                     self.extracting = false;
-                    self.status = format!(
-                        "Extraction complete: {} files, {:.1} MB/s peak",
-                        ev.done,
+                    self.show_progress = false;
+                    let (extracted_n, elapsed, bytes_n) = {
+                        let r = self.report.as_ref().map(|r| r.lock().unwrap().clone());
+                        match r {
+                            Some(rep) => (rep.extracted, rep.elapsed, rep.bytes),
+                            None => (ev.done, std::time::Duration::ZERO, ev.bytes_done),
+                        }
+                    };
+                    let mbps = if elapsed.as_secs_f64() > 0.01 {
+                        bytes_n as f64 / 1048576.0 / elapsed.as_secs_f64()
+                    } else {
                         ev.mbps
-                    );
+                    };
+                    let errors = self
+                        .report
+                        .as_ref()
+                        .map(|r| r.lock().unwrap().errors.clone())
+                        .unwrap_or_default();
+                    let n_err = errors.len();
+                    self.last_errors = errors;
+                    if ev.current == "__cancelled__" {
+                        self.status = Status::new(
+                            StatusKind::Warn,
+                            format!(
+                                "Extraction cancelled at {}/{} files ({} errors)",
+                                ev.done, ev.total, n_err
+                            ),
+                        );
+                    } else if n_err > 0 {
+                        self.status = Status::new(
+                            StatusKind::Err,
+                            format!(
+                                "Finished with {n_err} error{} — {} files extracted, {:.1} MB/s. Click the red badge for details.",
+                                if n_err == 1 { "" } else { "s" },
+                                extracted_n,
+                                mbps
+                            ),
+                        );
+                    } else {
+                        self.status = Status::new(
+                            StatusKind::Ok,
+                            format!(
+                                "Extraction complete: {} files, {} in {:.1}s ({:.1} MB/s)",
+                                extracted_n,
+                                format_size(bytes_n),
+                                elapsed.as_secs_f64(),
+                                mbps
+                            ),
+                        );
+                    }
                 }
                 self.last_progress = Some(ev.clone());
             }
         }
     }
 
-    // -----------------------------------------------------------------------
+    /// Try to extract one file (right-panel button). Routes through the AES gate.
+    pub fn extract_selected(&mut self, sel: Option<VirtualFile>) {
+        let Some(vf) = sel else { return };
+        let Some(mount) = self.mount.clone() else { return };
+        if mount.is_file_encrypted(&vf) {
+            // single encrypted file: ask first
+            if !self.aes_gate(PendingAction::ExtractSelected(vf.clone())) {
+                return;
+            }
+        }
+        self.extract_one_now(&vf);
+    }
 
-    fn load_preview(&mut self, ctx: &egui::Context, vf: &VirtualFile) {
+    pub fn extract_one_now(&mut self, vf: &VirtualFile) {
+        let Some(mount) = self.mount.clone() else { return };
+        let out = PathBuf::from(&self.output_dir);
+        std::fs::create_dir_all(&out).ok();
+        let mut reader = match mount.open_source_reader(vf.source) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = Status::new(StatusKind::Err, format!("error: {e}"));
+                return;
+            }
+        };
+        let opts = uex_core::pipeline::ExtractOptions {
+            output_dir: out,
+            convert: self.convert,
+            ..Default::default()
+        };
+        let result = uex_core::pipeline::convert::extract_one(&mut reader, vf, &opts);
+        match result {
+            Ok(converted) => {
+                self.status = Status::new(
+                    StatusKind::Ok,
+                    if converted {
+                        format!("Extracted + converted: {}", vf.path)
+                    } else {
+                        format!("Extracted: {}", vf.path)
+                    },
+                );
+            }
+            Err(e) => {
+                self.status = Status::new(StatusKind::Err, format!("error: {e}"));
+            }
+        }
+    }
+
+    /// Called by the key prompt when the user saves a key.
+    /// On failure returns an actionable error message (prompt stays open).
+    pub fn apply_key(&mut self, hex: String) -> std::result::Result<(), String> {
+        let Some(key) = AesKey::parse(&hex) else {
+            return Err("Key must be 64 hex characters (32 bytes).".into());
+        };
+        // name it after the archive or incrementally
+        let name = match &self.archive_name {
+            n if !n.is_empty() => format!("Key — {n}"),
+            _ => format!("Key {}", self.keys.len() + 1),
+        };
+        self.keys.retain(|k| k.name != name);
+        self.keys.push(KeyEntry {
+            name: name.clone(),
+            hex: hex.trim().trim_start_matches("0x").replace(['-', ' '], "").to_lowercase(),
+        });
+        self.active_key = Some(name);
+        self.save_persisted();
+
+        // validate against the loaded archive when possible
+        if let Some(mount) = self.mount.clone() {
+            if mount.encrypted_file_count() > 0 {
+                if let Err(e) = mount.test_key(&key) {
+                    return Err(format!(
+                        "Key was saved but FAILED verification: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // preview
+
+    pub fn load_preview(&mut self, ctx: &egui::Context, vf: &VirtualFile) {
         let lower = vf.path.to_lowercase();
         let Some(mount) = self.mount.clone() else { return };
         let mut reader = match mount.open_source_reader(vf.source) {
@@ -399,173 +781,104 @@ impl App {
                 }
             }
         }
+        // Unity serialized files: CAB-* inside bundles, .assets, level*, …
+        if let Ok(data) = reader.read(vf) {
+            if uex_core::unity::looks_like_serialized_file(&data) {
+                self.load_unity_preview(ctx, &vf.path, data, &mut reader);
+                return;
+            }
+        }
         self.preview = Preview::Unsupported("No preview available for this file type.".into());
     }
 
-    fn find_sibling(&self, path: &str, ext: &str) -> Option<String> {
+    /// Unity preview: first decodable Texture2D/Sprite in the serialized file,
+    /// otherwise a compact object listing.
+    fn load_unity_preview(
+        &mut self,
+        ctx: &egui::Context,
+        path: &str,
+        data: Vec<u8>,
+        reader: &mut uex_core::mount::SourceReader,
+    ) {
+        let mut sf = match uex_core::unity::serialized::SerializedFile::parse(data) {
+            Ok(sf) => sf,
+            Err(e) => {
+                self.preview = Preview::Unsupported(format!("Unity parse failed: {e}"));
+                return;
+            }
+        };
+        sf.load_container();
+        let (bundle, base_dir) = reader.unity_context();
+        let res = uex_core::unity::objects::ResourceContext::new(bundle, base_dir);
+
+        // try textures first
+        for obj in &sf.objects {
+            if obj.class_id == uex_core::unity::class_id::TEXTURE_2D {
+                if let Ok((_cls, value)) = sf.read_object(obj) {
+                    if let Ok((tex, rgba)) =
+                        uex_core::unity::objects::texture2d_data(&value, &sf, &res)
+                    {
+                        let size = [tex.width as usize, tex.height as usize];
+                        let handle = ctx.load_texture(
+                            path,
+                            egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+                            Default::default(),
+                        );
+                        self.preview = Preview::Texture(handle);
+                        return;
+                    }
+                }
+            }
+        }
+        // sprites next (crop from atlas textures)
+        let parsed: Vec<(uex_core::unity::serialized::ObjectInfo, String, uex_core::unity::typetree::UValue)> =
+            sf.objects.iter().filter_map(|o| sf.read_object(o).ok().map(|(c, v)| (o.clone(), c, v))).collect();
+        for (obj, _class, value) in &parsed {
+            if obj.class_id == uex_core::unity::class_id::SPRITE {
+                if let Ok((tex, rgba)) = uex_core::unity::objects::sprite_rgba(
+                    value,
+                    &sf.object_name(obj, value),
+                    &sf,
+                    &res,
+                    &parsed,
+                ) {
+                    let size = [tex.width as usize, tex.height as usize];
+                    let handle = ctx.load_texture(
+                        path,
+                        egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+                        Default::default(),
+                    );
+                    self.preview = Preview::Texture(handle);
+                    return;
+                }
+            }
+        }
+        // fallback: object listing
+        let mut text = format!(
+            "Unity SerializedFile\nengine: {}  |  serialized v{}  |  {} objects\n\n",
+            sf.unity_version_raw,
+            sf.header.version,
+            sf.objects.len()
+        );
+        for obj in &sf.objects {
+            let class = uex_core::unity::class_name(obj.class_id);
+            let name = parsed
+                .iter()
+                .find(|(o, _, _)| o.path_id == obj.path_id)
+                .map(|(o, _, v)| sf.object_name(o, v))
+                .unwrap_or_else(|| "?".into());
+            text.push_str(&format!("  {:>8}  {:<14} {}\n", obj.path_id, class, name));
+        }
+        self.preview = Preview::Text(text);
+    }
+
+    pub fn find_sibling(&self, path: &str, ext: &str) -> Option<String> {
         let base = path.trim_end_matches(".uasset");
         let candidate = format!("{base}.{ext}");
         self.flat_files.iter().find(|f| f.path == candidate).map(|_| candidate)
     }
-}
 
-fn render_tree_nodes(
-    ui: &mut egui::Ui,
-    nodes: &[TreeNode],
-    expanded: &mut std::collections::HashSet<String>,
-    selected_path: Option<&str>,
-    to_select: &mut Option<VirtualFile>,
-    to_toggle: &mut Option<String>,
-) {
-    for node in nodes {
-        let has_children = !node.children.is_empty();
-        if has_children {
-            let open = expanded.contains(&node.full_path);
-            let chevron = if open { "▾" } else { "▸" };
-            let resp = ui.selectable_label(open, format!("{chevron} 📁 {}", node.name));
-            if resp.clicked() {
-                *to_toggle = Some(node.full_path.clone());
-            }
-            if open {
-                egui::Grid::new(format!("indent_{}", node.full_path)).num_columns(1).show(ui, |ui| {
-                    render_tree_nodes(ui, &node.children, expanded, selected_path, to_select, to_toggle);
-                });
-            }
-        } else if node.file.is_some() {
-            let icon = type_icon(&node.name);
-            let selected = selected_path.map(|p| node.full_path.ends_with(p)).unwrap_or(false);
-            if ui.selectable_label(selected, format!("{icon} {}", node.name)).clicked() {
-                *to_select = node.file.clone();
-            }
-        }
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_progress();
-        self.autoshot_tick(ctx);
-
-        // drag & drop
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(f) = dropped.first() {
-            if let Some(p) = &f.path {
-                self.open_path(p.clone());
-            }
-        }
-        let repainting = self.extracting;
-        if repainting {
-            ctx.request_repaint();
-        }
-
-        self.toolbar(ctx);
-        self.status_bar(ctx);
-        self.left_panel(ctx);
-        self.right_panel(ctx);
-        self.center_panel(ctx);
-        if self.show_settings {
-            self.settings_window(ctx);
-        }
-        if self.show_keys {
-            self.keys_window(ctx);
-        }
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_persisted();
-    }
-}
-
-impl App {
-    fn autoshot_tick(&mut self, ctx: &egui::Context) {
-        use std::time::{Duration, Instant};
-        let Some(shot) = &self.autoshot else { return };
-        let stage = shot.stage;
-        let out_dir = shot.out_dir.clone();
-        let archive = shot.archive.clone();
-        let big = shot.big_archive.clone();
-        match stage {
-            0 => {
-                // open the demo archive
-                self.open_path(archive);
-                self.next_stage();
-            }
-            1 => {
-                // expand tree fully
-                self.expand_all();
-                self.next_stage();
-            }
-            2 => {
-                // wait 30 frames for the tree to lay out, then capture
-                self.tick_and_capture(ctx, &out_dir, "01_main_window.png", 40);
-            }
-            3 => {
-                // select the texture asset for preview
-                let target = self
-                    .flat_files
-                    .iter()
-                    .find(|f| {
-                        f.path.ends_with(".png")
-                            || f.path.ends_with(".uasset")
-                            || f.path.ends_with(".glb")
-                    })
-                    .cloned();
-                if let Some(vf) = target {
-                    self.selected = Some(vf.clone());
-                    self.load_preview(ctx, &vf);
-                }
-                self.next_stage();
-            }
-            4 => self.tick_and_capture(ctx, &out_dir, "02_texture_preview.png", 40),
-            5 => {
-                // start a real extraction of the big archive in background
-                if let Some(big) = big {
-                    self.open_path(big);
-                    self.extract(None);
-                }
-                self.next_stage();
-            }
-            6 => self.tick_and_capture(ctx, &out_dir, "03_extraction_progress.png", 45),
-            7 => {
-                self.show_settings = true;
-                self.next_stage();
-            }
-            8 => self.tick_and_capture(ctx, &out_dir, "04_settings_dialog.png", 40),
-            _ => {
-                // done — save capture summary and exit
-                self.save_persisted();
-                std::process::exit(0);
-            }
-        }
-        let _ = Duration::from_millis(0);
-        let _ = Instant::now();
-    }
-
-    fn next_stage(&mut self) {
-        if let Some(shot) = &mut self.autoshot {
-            shot.stage += 1;
-            shot.frames_in_stage = 0;
-        }
-    }
-
-    fn tick_and_capture(&mut self, ctx: &egui::Context, out_dir: &std::path::Path, name: &str, frames: u32) {
-        if let Some(shot) = &mut self.autoshot {
-            shot.frames_in_stage += 1;
-            if shot.frames_in_stage >= frames {
-                let screen = crate::capture::capture_root_window();
-                if let Ok(png) = screen {
-                    let path = out_dir.join(name);
-                    if std::fs::write(&path, png).is_ok() {
-                        log::info!("screenshot saved: {}", path.display());
-                    }
-                }
-                self.next_stage();
-            }
-        }
-        ctx.request_repaint();
-    }
-
-    fn expand_all(&mut self) {
+    pub fn expand_all(&mut self) {
         fn walk(node: &TreeNode, expanded: &mut std::collections::HashSet<String>) {
             expanded.insert(node.full_path.clone());
             for c in &node.children {
@@ -576,442 +889,92 @@ impl App {
             walk(node, &mut self.expanded);
         }
     }
+}
 
-    fn toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                if ui.button(RichText::new("📂 Open").size(14.0)).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Unreal archives", &["pak", "utoc"])
-                        .add_filter("All files", &["*"])
-                        .pick_file()
-                    {
-                        self.open_path(path);
-                    }
-                }
-                ui.separator();
-                let can_extract = self.mount.is_some();
-                if ui
-                    .add_enabled(can_extract, egui::Button::new(RichText::new("📦 Extract all").size(14.0)))
-                    .clicked()
-                {
-                    self.extract(None);
-                }
-                if ui
-                    .add_enabled(self.selected.is_some() && can_extract, egui::Button::new("Extract selected"))
-                    .clicked()
-                {
-                    let sel = self.selected.clone();
-                    self.extract_selected(sel);
-                }
-                ui.separator();
-                ui.label("Search:");
-                ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(220.0));
-                if ui.button("✕").clicked() {
-                    self.filter.clear();
-                }
-                ui.separator();
-                ui.toggle_value(&mut self.convert, "Convert assets");
-                ui.separator();
-                if ui.button("🔑 AES keys").clicked() {
-                    self.show_keys = !self.show_keys;
-                }
-                if ui.button("⚙ Settings").clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-                ui.separator();
-                egui::ComboBox::from_id_salt("recent")
-                    .selected_text("🕘 Recent")
-                    .show_ui(ui, |ui| {
-                        for r in self.recent.clone() {
-                            if ui.selectable_label(false, &r).clicked() {
-                                self.open_path(PathBuf::from(&r));
-                            }
-                        }
-                    });
-            });
-            ui.add_space(4.0);
-        });
+// ---------------------------------------------------------------------------
+// shared small helpers (used by ui.rs too)
+
+pub fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+pub fn format_size(size: u64) -> String {
+    if size >= 1 << 20 {
+        format!("{:.1} MB", size as f64 / 1048576.0)
+    } else if size >= 1 << 10 {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    } else {
+        format!("{size} B")
     }
+}
 
-    fn extract_selected(&mut self, sel: Option<VirtualFile>) {
-        // For v1 the selected file is extracted + converted synchronously (single item).
-        let Some(vf) = sel else { return };
-        let Some(mount) = self.mount.clone() else { return };
-        let out = PathBuf::from(&self.output_dir);
-        std::fs::create_dir_all(&out).ok();
-        let mut reader = match mount.open_source_reader(vf.source) {
-            Ok(r) => r,
-            Err(e) => {
-                self.status = format!("error: {e}");
-                return;
-            }
-        };
-        let opts = uex_core::pipeline::ExtractOptions {
-            output_dir: out,
-            convert: self.convert,
-            ..Default::default()
-        };
-        let result = uex_core::pipeline::convert::extract_one(&mut reader, &vf, &opts);
-        match result {
-            Ok(converted) => {
-                self.status = if converted {
-                    format!("Extracted + converted: {}", vf.path)
-                } else {
-                    format!("Extracted: {}", vf.path)
-                };
-            }
-            Err(e) => self.status = format!("error: {e}"),
-        }
+/// (glyph, color) for a file type.
+pub fn type_icon(path: &str) -> (&'static str, egui::Color32) {
+    use crate::theme::Palette;
+    let lower = path.to_lowercase();
+    if lower.ends_with(".uasset") || lower.ends_with(".uexp") {
+        (ic::PACKAGE, Palette::C_PACKAGE)
+    } else if lower.ends_with(".ubulk") {
+        (ic::DATA, Palette::C_DATA)
+    } else if lower.ends_with(".pak") || lower.ends_with(".utoc") || lower.ends_with(".ucas")
+        || lower.ends_with(".bundle") || lower.ends_with(".unity3d") {
+        (ic::ARCHIVE, Palette::ACCENT)
+    } else if lower.ends_with(".png") || lower.ends_with(".tga") || lower.ends_with(".dds")
+        || lower.ends_with(".exr") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+        || lower.ends_with(".bmp") {
+        (ic::TEXTURE, Palette::C_IMAGE)
+    } else if lower.ends_with(".glb") || lower.ends_with(".gltf") || lower.ends_with(".obj")
+        || lower.ends_with(".fbx") || lower.ends_with(".usm") {
+        (ic::MESH, Palette::C_MESH)
+    } else if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3")
+        || lower.ends_with(".opus") || lower.ends_with(".bnk") || lower.ends_with(".wem") {
+        (ic::AUDIO, Palette::C_AUDIO)
+    } else if lower.ends_with(".json") || lower.ends_with(".csv") || lower.ends_with(".xml") {
+        (ic::DATA, Palette::C_DATA)
+    } else if lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".fnt")
+        || lower.ends_with(".ufo") {
+        (ic::FONT, Palette::C_FONT)
+    } else if lower.ends_with(".lua") || lower.ends_with(".py") || lower.ends_with(".js")
+        || lower.ends_with(".cs") || lower.ends_with(".ini") || lower.ends_with(".txt")
+        || lower.ends_with(".bytes") {
+        (ic::CODE, Palette::C_DATA)
+    } else if lower.ends_with(".uasset") {
+        (ic::BLUEPRINT, Palette::C_PACKAGE)
+    } else {
+        (ic::FILE, Palette::C_FILE)
     }
+}
 
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                if let Some(ev) = &self.last_progress {
-                    if self.extracting {
-                        let pct = if ev.total > 0 { ev.done as f32 / ev.total as f32 } else { 0.0 };
-                        ui.add(
-                            egui::ProgressBar::new(pct)
-                                .show_percentage()
-                                .desired_width(220.0),
-                        );
-                        ui.label(format!(
-                            "{:.1} MB/s · ETA {:.0}s · {} errors",
-                            ev.mbps, ev.eta_secs, ev.errors
-                        ));
-                        ui.separator();
-                        ui.monospace(if ev.current.len() > 48 { format!("…{}", &ev.current[ev.current.len()-47..]) } else { ev.current.clone() });
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(&self.status).color(Color32::from_rgb(160, 160, 170)));
-                });
-            });
-            ui.add_space(2.0);
-        });
-    }
-
-    fn left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("tree")
-            .default_width(280.0)
-            .width_range(220.0..=320.0)
-            .show(ctx, |ui| {
-            ui.heading("Archive tree");
-            ui.separator();
-            if self.mount.is_none() {
-                ui.label(RichText::new("No archive loaded.").weak());
-                ui.add_space(8.0);
-                ui.label("Supported: .pak, .utoc/.ucas");
-                return;
-            }
-            let mut to_select: Option<VirtualFile> = None;
-            let mut to_toggle: Option<String> = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let selected_path = self.selected.as_ref().map(|s| s.path.clone());
-                render_tree_nodes(ui, &self.tree, &mut self.expanded, selected_path.as_deref(), &mut to_select, &mut to_toggle);
-            });
-            if let Some(p) = to_toggle {
-                if self.expanded.contains(&p) { self.expanded.remove(&p); } else { self.expanded.insert(p); }
-            }
-            if let Some(vf) = to_select {
-                self.selected = Some(vf.clone());
-                self.load_preview(ctx, &vf);
-            }
-        });
-    }
-
-    fn center_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.mount.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.heading(RichText::new("UExtractor").size(42.0).strong());
-                    ui.label(RichText::new("Unreal Engine .pak / .ucas / .utoc asset extractor").size(16.0));
-                    ui.add_space(16.0);
-                    ui.label("Drop an archive here, or use 📂 Open.");
-                    if !self.recent.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Recent archives:").weak());
-                        for r in self.recent.clone() {
-                            if ui.link(&r).clicked() {
-                                self.open_path(PathBuf::from(r));
-                            }
-                        }
-                    }
-                });
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.heading("Assets");
-                ui.separator();
-                ui.selectable_value(&mut self.view_mode, ViewMode::List, "☰ List");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Grid, "▦ Grid");
-                ui.separator();
-                ui.label(format!("{} files", self.filtered_files().len()));
-            });
-            ui.separator();
-
-            let files: Vec<VirtualFile> = self.filtered_files().into_iter().cloned().collect();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                match self.view_mode {
-                    ViewMode::List => {
-                        egui::Grid::new("assets_grid")
-                            .num_columns(3)
-                            .striped(true)
-                            .min_col_width(90.0)
-                            .show(ui, |ui| {
-                                ui.strong("Icon");
-                                ui.strong("Path");
-                                ui.strong("Size");
-                                ui.end_row();
-                                let sel_path = self.selected.as_ref().map(|s| s.path.clone());
-                                for f in &files {
-                                    let icon = type_icon(&f.path);
-                                    let selected = sel_path.as_ref() == Some(&f.path);
-                                    if ui.selectable_label(selected, icon).clicked() {
-                                        let vf = (*f).clone();
-                                        self.selected = Some(vf.clone());
-                                        self.load_preview(ctx, &vf);
-                                    }
-                                    if ui
-                                        .selectable_label(selected, RichText::new(&f.path).monospace())
-                                        .clicked()
-                                    {
-                                        let vf = (*f).clone();
-                                        self.selected = Some(vf.clone());
-                                        self.load_preview(ctx, &vf);
-                                    }
-                                    ui.label(format_size(f.size));
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                    ViewMode::Grid => {
-                        let card_w = 132.0;
-                        egui::Grid::new("assets_cards")
-                            .num_columns((ui.available_width() / card_w).max(1.0) as usize)
-                            .show(ui, |ui| {
-                                let sel_path = self.selected.as_ref().map(|s| s.path.clone());
-                                for f in &files {
-                                    ui.vertical(|ui| {
-                                        let selected = sel_path.as_ref() == Some(&f.path);
-                                        let thumb: Option<&egui::TextureHandle> = self.textures.get(&f.path);
-                                        let cell = ui.allocate_ui(egui::vec2(card_w - 8.0, 110.0), |ui| {
-                                            if let Some(tex) = thumb {
-                                                ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(110.0, 84.0)));
-                                            } else {
-                                                ui.centered_and_justified(|ui| {
-                                                    ui.label(RichText::new(type_icon(&f.path)).size(34.0));
-                                                });
-                                            }
-                                            ui.add_sized(
-                                                [card_w - 10.0, 14.0],
-                                                egui::Label::new(
-                                                    RichText::new(file_name(&f.path)).small(),
-                                                )
-                                                .truncate(),
-                                            );
-                                        });
-                                        let resp = cell.response;
-                                        if resp.clicked() {
-                                            let vf = (*f).clone();
-                                            self.selected = Some(vf.clone());
-                                            self.load_preview(ctx, &vf);
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                }
-            });
-        });
-    }
-
-    fn right_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("details").default_width(360.0).show(ctx, |ui| {
-            ui.heading("Details & preview");
-            ui.separator();
-            if let Some(vf) = &self.selected {
-                ui.monospace(RichText::new(&vf.path).size(13.0));
-                ui.label(format!("Size: {} bytes", vf.size));
-                ui.label(format!("Type: {}", file_type_name(&vf.path)));
-                ui.separator();
-                match &mut self.preview {
-                    Preview::None => {
-                        ui.label("Select an asset to preview.");
-                    }
-                    Preview::Texture(tex) => {
-                        let avail = ui.available_width();
-                        ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(avail, avail * 0.75)));
-                        ui.caption("Texture preview (decoded)");
-                    }
-                    Preview::Mesh { mesh, rot_x, rot_y, zoom } => {
-                        let (rx_, ry_, z_) = (rot_x, rot_y, zoom);
-                        mesh_preview_ui(ui, mesh, rx_, ry_, z_);
-                        ui.caption("Drag to rotate · scroll to zoom");
-                    }
-                    Preview::Text(t) => {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.monospace(t.as_str());
-                        });
-                    }
-                    Preview::Unsupported(t) => {
-                        ui.label(RichText::new(t.as_str()).weak());
-                    }
-                }
-                ui.separator();
-                if ui.button("💾 Extract this file").clicked() {
-                    let sel = self.selected.clone();
-                    self.extract_selected(sel);
-                }
-            } else {
-                ui.label("No asset selected.");
-            }
-        });
-    }
-
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings;
-        let mut output_dir = self.output_dir.clone();
-        let mut formats = self.formats.clone();
-        let mut convert = self.convert;
-        let mut queue = self.queue.clone();
-        let mut browse = false;
-        let mut add_current = false;
-        let mut process = false;
-        let mut remove_idx: Option<usize> = None;
-
-        egui::Window::new("Export settings")
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Destination:");
-                    ui.add(egui::TextEdit::singleline(&mut output_dir).desired_width(240.0));
-                    browse = ui.button("Browse…").clicked();
-                });
-                ui.separator();
-                ui.label(RichText::new("Export formats").strong());
-                ui.checkbox(&mut formats.png, "Textures → PNG (decoded)");
-                ui.checkbox(&mut formats.dds, "Textures → DDS (original compression)");
-                ui.checkbox(&mut formats.glb, "Meshes → GLTF 2.0 (.glb)");
-                ui.checkbox(&mut formats.obj, "Meshes → OBJ (fallback)");
-                ui.checkbox(&mut formats.json, "Materials/Tables/Blueprints → JSON");
-                ui.checkbox(&mut formats.audio, "Audio → WAV / OGG");
-                ui.separator();
-                ui.checkbox(&mut convert, "Enable conversion on extract");
-                ui.separator();
-                ui.label(RichText::new("Batch queue").strong());
-                for (i, item) in queue.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}. {}", i + 1, item));
-                        if ui.small_button("remove").clicked() {
-                            remove_idx = Some(i);
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    add_current = ui.button("Add current archive to queue").clicked();
-                    process = ui.button("Process next in queue").clicked() && !queue.is_empty();
-                });
-            });
-
-        if browse {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                output_dir = dir.display().to_string();
-            }
-        }
-        if add_current {
-            if let Some(m) = &self.mount {
-                for i in 0..m.source_count() {
-                    queue.push(m.source_path(i));
-                }
-            }
-        }
-        if let Some(i) = remove_idx {
-            queue.remove(i);
-        }
-        if process {
-            let first = queue.remove(0);
-            queue.clear();
-            self.open_path(PathBuf::from(&first));
-            self.extract(None);
-        }
-        self.show_settings = open;
-        self.output_dir = output_dir;
-        self.formats = formats;
-        self.convert = convert;
-        self.queue = queue;
-        self.save_persisted();
-    }
-
-    fn keys_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_keys;
-        let mut keys = self.keys.clone();
-        let mut active_key = self.active_key.clone();
-        let mut add_name = String::new();
-        let mut add_hex = String::new();
-        let mut add = false;
-        let mut remove: Option<String> = None;
-        let mut activate: Option<String> = None;
-
-        egui::Window::new("AES key manager")
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Keys are stored locally and used for encrypted archives.");
-                ui.separator();
-                for key in &keys {
-                    ui.horizontal(|ui| {
-                        let active = active_key.as_ref() == Some(&key.name);
-                        if ui.radio(active, key.name.as_str()).clicked() {
-                            activate = Some(key.name.clone());
-                        }
-                        let shown = if key.hex.len() > 16 {
-                            format!("{}…{}", &key.hex[..8], &key.hex[key.hex.len() - 8..])
-                        } else {
-                            key.hex.clone()
-                        };
-                        ui.monospace(RichText::new(shown).weak());
-                        if ui.small_button("✕").clicked() {
-                            remove = Some(key.name.clone());
-                        }
-                    });
-                }
-                ui.separator();
-                ui.label("Add key:");
-                ui.text_edit_singleline(&mut add_name);
-                ui.text_edit_singleline(&mut add_hex);
-                add = ui.button("Add").clicked();
-            });
-
-        if let Some(n) = activate {
-            active_key = Some(n);
-        }
-        if let Some(n) = remove {
-            keys.retain(|k| k.name != n);
-            if active_key.as_deref() == Some(&n) {
-                active_key = None;
-            }
-        }
-        if add && !add_name.is_empty() && AesKey::parse(&add_hex).is_some() {
-            keys.push(KeyEntry { name: add_name, hex: add_hex });
-        }
-        self.show_keys = open;
-        self.keys = keys;
-        self.active_key = active_key;
-        self.save_persisted();
+pub fn file_type_name(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".uasset") {
+        "Unreal package"
+    } else if lower.ends_with(".ubulk") {
+        "Bulk data"
+    } else if lower.ends_with(".uexp") {
+        "Export data"
+    } else if lower.ends_with(".pak") {
+        "Unreal pak archive"
+    } else if lower.ends_with(".utoc") || lower.ends_with(".ucas") {
+        "Unreal IOStore container"
+    } else if lower.ends_with(".bundle") || lower.ends_with(".assetbundle") {
+        "Unity asset bundle"
+    } else if lower.ends_with(".unity3d") {
+        "Unity bundle"
+    } else if lower.ends_with(".assets") {
+        "Unity serialized assets"
+    } else if lower.ends_with(".resource") || lower.ends_with(".ress") {
+        "Unity streamed resource"
+    } else {
+        "File"
     }
 }
 
 // ---------------------------------------------------------------------------
 // 3D mesh preview (software-rendered through egui's painter)
 
-fn mesh_preview_ui(ui: &mut egui::Ui, mesh: &uex_core::assets::mesh::ExtractedMesh, rot_x: &mut f32, rot_y: &mut f32, zoom: &mut f32) {
-    let (rect, resp) = ui.allocate_exact_size(ui.available_size_before_wrap().min(egui::vec2(340.0, 260.0)), egui::Sense::drag());
+pub fn mesh_preview_ui(ui: &mut egui::Ui, mesh: &uex_core::assets::mesh::ExtractedMesh, rot_x: &mut f32, rot_y: &mut f32, zoom: &mut f32) {
+    let (rect, resp) = ui.allocate_exact_size(ui.available_size_before_wrap().min(egui::vec2(360.0, 280.0)), egui::Sense::drag());
     *rot_y += resp.drag_delta().x * 0.01;
     *rot_x += resp.drag_delta().y * 0.01;
     *rot_x = rot_x.clamp(-1.5, 1.5);
@@ -1024,15 +987,15 @@ fn mesh_preview_ui(ui: &mut egui::Ui, mesh: &uex_core::assets::mesh::ExtractedMe
     let (cx, cy, cz) = (center[0], center[1], center[2]);
     let scale = *zoom * rect.width().min(rect.height()) / 2.6 / mesh_radius(mesh).max(0.001);
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 18, 24));
+    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(0x10, 0x11, 0x16));
 
     let (sy, cy_) = rot_y.sin_cos();
     let (sx, cx_) = rot_x.sin_cos();
-    let mut tris: Vec<(f32, [egui::Pos2; 3], [Color32; 3])> = Vec::new();
+    let mut tris: Vec<(f32, [egui::Pos2; 3], [egui::Color32; 3])> = Vec::new();
     for section in &mesh.sections {
         for tri in section.indices.chunks_exact(3) {
             let mut pts = [egui::Pos2::ZERO; 3];
-            let mut cols = [Color32::WHITE; 3];
+            let mut cols = [egui::Color32::WHITE; 3];
             let mut zavg = 0.0;
             for (k, &idx) in tri.iter().enumerate() {
                 let Some(v) = mesh.vertices.get(idx as usize) else { continue };
@@ -1048,10 +1011,10 @@ fn mesh_preview_ui(ui: &mut egui::Ui, mesh: &uex_core::assets::mesh::ExtractedMe
                 let z2 = p[1] * sx + z1 * cx_;
                 zavg += z2;
                 let light = (v.normal[0] * 0.3 + v.normal[1] * 0.5 + v.normal[2] * 0.4).clamp(0.05, 1.0);
-                let c = Color32::from_rgb(
-                    (120.0 + 110.0 * light) as u8,
-                    (90.0 + 90.0 * light) as u8,
-                    (170.0 + 70.0 * light) as u8,
+                let c = egui::Color32::from_rgb(
+                    (90.0 + 130.0 * light) as u8,
+                    (110.0 + 120.0 * light) as u8,
+                    (200.0 + 45.0 * light) as u8,
                 );
                 pts[k] = egui::Pos2::new(
                     rect.center().x + x1 * scale,
@@ -1101,66 +1064,6 @@ fn mesh_center(mesh: &uex_core::assets::mesh::ExtractedMesh) -> ([f32; 3], f32, 
 
 fn mesh_radius(mesh: &uex_core::assets::mesh::ExtractedMesh) -> f32 {
     mesh_center(mesh).1
-}
-
-// ---------------------------------------------------------------------------
-
-fn type_icon(path: &str) -> &'static str {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".uasset") || lower.ends_with(".uexp") {
-        "📦"
-    } else if lower.ends_with(".ubulk") {
-        "🗄"
-    } else if lower.ends_with(".utoc") || lower.ends_with(".ucas") || lower.ends_with(".pak") {
-        "🗃"
-    } else if lower.ends_with(".png") || lower.ends_with(".tga") || lower.ends_with(".dds") {
-        "🖼"
-    } else if lower.ends_with(".glb") || lower.ends_with(".gltf") || lower.ends_with(".obj") {
-        "🧊"
-    } else if lower.ends_with(".ogg") || lower.ends_with(".wav") {
-        "🔊"
-    } else if lower.ends_with(".json") {
-        "📄"
-    } else {
-        "▪"
-    }
-}
-
-fn file_type_name(path: &str) -> &'static str {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".uasset") {
-        "Unreal package"
-    } else if lower.ends_with(".ubulk") {
-        "Bulk data"
-    } else if lower.ends_with(".uexp") {
-        "Export data"
-    } else {
-        "File"
-    }
-}
-
-fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-fn format_size(size: u64) -> String {
-    if size >= 1 << 20 {
-        format!("{:.1} MB", size as f64 / 1048576.0)
-    } else if size >= 1 << 10 {
-        format!("{:.1} KB", size as f64 / 1024.0)
-    } else {
-        format!("{size} B")
-    }
-}
-
-trait UiCaptionExt {
-    fn caption(&mut self, text: &str);
-}
-
-impl UiCaptionExt for egui::Ui {
-    fn caption(&mut self, text: &str) {
-        self.label(RichText::new(text).small().color(Color32::from_rgb(140, 140, 150)));
-    }
 }
 
 /// Minimal GLB reader for the preview: extracts positions, normals and indices

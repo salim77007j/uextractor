@@ -2,9 +2,10 @@
 
 # UExtractor
 
-**Fast, parallel Unreal Engine `.pak` / `.ucas` / `.utoc` asset extractor — written entirely in Rust.**
+**Fast, parallel Unreal Engine + Unity asset extractor — written entirely in Rust.**
 
-GUI + CLI · UE4 & UE5 · AES-256 · Oodle (Kraken/Mermaid/Selkie/Leviathan) · GLTF · PNG/DDS · JSON
+GUI + CLI · UE4 & UE5 (.pak/.utoc/.ucas) · Unity (.bundle/.unity3d/.assets/level*/sharedassets*) ·
+AES-256 + UnityCN · Oodle (Kraken/Mermaid/Selkie/Leviathan) · GLTF · PNG/DDS · JSON
 
 </div>
 
@@ -32,6 +33,25 @@ parallel across all CPU cores, and converts game assets into industry-standard f
 - **Compression** — Oodle (official oo2core 2.9.10, hash-verified runtime download),
   Zlib, Gzip, LZ4, Zstd, None
 - **Encryption** — AES-256 ECB (UE FAES3) for indices and payloads
+
+### Unity Engine support (v1.2)
+
+- **AssetBundles** — UnityFS / UnityWeb / UnityRaw (format 6/7, big-endian headers),
+  LZ4 / LZ4HC / LZMA blocks, block-info-at-end and 16-byte-aligned layouts (2019.4.15+),
+  Unity's official UnityCN encryption (16-char key, validated via signature check)
+- **SerializedFiles** — `.assets`, extensionless `level*`/`sharedassets*`/`globalgamemanagers*`,
+  `data.unity3d`, `CAB-*` nodes inside bundles; serialized file versions 3–26 (Unity 3.4 → 6000.x),
+  32/64-bit path ids, big-endian headers
+- **Type trees** — embedded trees (v10/v12/23 "mhtt" blobs + legacy form) and stripped trees
+  resolved through an embedded AssetRipper TPK type database (exact layouts for every class
+  and engine version)
+- **Streamed data** — `.resource` / `.resS` files (audio, video, mesh vertex streams), resolved
+  inside bundles or as sibling files — the Unity analogue of UE's `.ubulk`
+- **Asset conversion** — Texture2D (RGBA32, DXT1/5, BC4/5/6/7, ASTC, ETC2, EAC, ATC, PVRTC,
+  crunched DXT1/DXT5/ETC2 via Unity's crunch), Sprite (rect crop from atlas), Mesh → **GLB**,
+  AudioClip → payload (`.fsb`/`.ogg`/`.mp3`/`.wav`), TextAsset, Material/GameObject/AssetBundle → JSON
+- **GUI/CLI** — same mount pipeline as UE archives: browse, preview (decoded textures/sprites,
+  object lists), extract with conversion; UnityCN key prompt before extraction
 
 ## Quick start (CLI)
 

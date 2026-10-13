@@ -23,8 +23,8 @@ enum ConvertFormat {
 #[command(
     name = "uex",
     version,
-    about = "UExtractor — Unreal Engine .pak / .utoc / .ucas asset extractor",
-    long_about = "Fast, parallel Unreal Engine archive extractor with real asset conversion.\nSupports PAK v1-v11, IOStore (.ucas/.utoc), AES-256 encryption and Oodle compression."
+    about = "UExtractor — Unreal Engine & Unity game asset extractor",
+    long_about = "Fast, parallel game archive extractor with real asset conversion.\nSupports Unreal PAK v1-v11, IOStore (.ucas/.utoc), Unity bundles (.bundle/.unity3d),\nserialized files (.assets, level*, sharedassets*), AES-256 encryption and Oodle compression."
 )]
 struct Cli {
     /// AES-256 key (hex, 0x prefix optional)
@@ -77,6 +77,9 @@ enum Command {
         /// convert assets (textures → PNG/DDS, meshes → GLB, audio → WAV/OGG, metadata → JSON)
         #[arg(long, value_enum, default_value_t = ConvertFormat::Auto)]
         convert: ConvertFormat,
+        /// skip AES-encrypted files instead of failing on them
+        #[arg(long)]
+        skip_encrypted: bool,
     },
     /// Test a single AES key against an archive
     TestKey {
@@ -142,12 +145,40 @@ fn resolve_key(cli: &Cli) -> Option<AesKey> {
     None
 }
 
+/// Split the --aes value into the UE hex key and/or a UnityCN 16-char key.
+fn resolve_keys(cli: &Cli) -> uex_core::mount::MountKeys {
+    let mut keys = uex_core::mount::MountKeys::default();
+    let mut candidate: Option<String> = None;
+    if let Some(text) = &cli.aes {
+        candidate = Some(text.clone());
+    }
+    if candidate.is_none() {
+        if let Some(file) = &cli.aes_file {
+            if let Ok(content) = std::fs::read_to_string(file) {
+                candidate = Some(content.lines().next().unwrap_or("").trim().to_string());
+            }
+        }
+    }
+    if let Some(text) = candidate {
+        if AesKey::parse(&text).is_some() {
+            keys.aes = AesKey::parse(&text);
+        } else if text.len() == 16 {
+            keys.unitycn = Some(text);
+        } else {
+            eprintln!(
+                "warning: key is neither 64-hex (UE AES) nor 16 characters (UnityCN), ignoring"
+            );
+        }
+    }
+    keys
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Info { path, format } => cmd_info(path, *format, cli),
         Command::List { path, format, filter } => cmd_list(path, *format, filter.as_deref(), cli),
-        Command::Extract { path, out, filter, ext, convert } => {
-            cmd_extract(path, out, filter.as_deref(), ext, *convert, cli)
+        Command::Extract { path, out, filter, ext, convert, skip_encrypted } => {
+            cmd_extract(path, out, filter.as_deref(), ext, *convert, *skip_encrypted, cli)
         }
         Command::TestKey { path, aes } => cmd_test_key(path, aes),
         Command::GenTestdata { out, files, file_mb } => cmd_gen_testdata(out, *files, *file_mb),
@@ -156,9 +187,14 @@ fn run(cli: &Cli) -> Result<()> {
 }
 
 fn open_mount(path: &PathBuf, cli: &Cli) -> Result<uex_core::mount::Mount> {
-    let key = resolve_key(cli);
-    let mount = uex_core::mount::Mount::open(path, key)
+    let keys = resolve_keys(cli);
+    let mount = uex_core::mount::Mount::open_with_keys(path, keys)
         .with_context(|| format!("failed to open {}", path.display()))?;
+    if mount.has_unity_encrypted() {
+        eprintln!(
+            "note: this archive uses Unity's UnityCN bundle encryption;\n      pass the game's 16-character key with --aes '<key>' (validated before extraction)"
+        );
+    }
     Ok(mount)
 }
 
@@ -176,6 +212,9 @@ fn cmd_info(path: &PathBuf, format: OutputFormat, cli: &Cli) -> Result<()> {
             println!("  sources:    {}", mount.source_count());
             for i in 0..mount.source_count() {
                 println!("    - {}", mount.source_path(i));
+            }
+            if mount.has_unity_encrypted() {
+                println!("  encryption: UnityCN bundle encryption detected (needs a 16-char key via --aes)");
             }
             println!("  files:      {}", mount.file_count());
             println!("  total size: {:.2} MB", mount.total_size as f64 / 1048576.0);
@@ -215,15 +254,26 @@ fn cmd_extract(
     filter: Option<&str>,
     ext: &[String],
     convert: ConvertFormat,
+    skip_encrypted: bool,
     cli: &Cli,
 ) -> Result<()> {
     let mount = open_mount(path, cli)?;
+    // pre-flight: encrypted files need a key — say so BEFORE extracting
+    let enc = mount.encrypted_file_count();
+    if enc > 0 && !skip_encrypted && cli.aes.is_none() {
+        eprintln!(
+            "warning: {enc} file(s) in this archive are AES-encrypted and NO key was supplied (--aes)."
+        );
+        eprintln!("         Those files will fail to extract. Pass --aes <hex64> with the game key,");
+        eprintln!("         or use --skip-encrypted to extract only the unencrypted files.");
+    }
     let opts = uex_core::pipeline::ExtractOptions {
         filter: filter.map(|s| s.to_string()),
         extensions: ext.iter().map(|e| format!(".{}", e.trim_start_matches('.'))).collect(),
         output_dir: out.clone(),
         threads: cli.jobs,
         convert: convert == ConvertFormat::Auto,
+        skip_encrypted,
         ..Default::default()
     };
     let planned = uex_core::pipeline::plan(&mount, &opts);
@@ -256,10 +306,27 @@ fn cmd_extract(
 }
 
 fn cmd_test_key(path: &PathBuf, aes: &str) -> Result<()> {
-    let key = AesKey::parse(aes).context("invalid AES key")?;
-    let mount = uex_core::mount::Mount::open(path, Some(key)).context("failed to open with key")?;
-    println!("key accepted: {} files, {:.2} MB", mount.file_count(), mount.total_size as f64 / 1048576.0);
-    Ok(())
+    if let Some(key) = AesKey::parse(aes) {
+        let mount = uex_core::mount::Mount::open(path, Some(key)).context("failed to open with key")?;
+        println!("key accepted: {} files, {:.2} MB", mount.file_count(), mount.total_size as f64 / 1048576.0);
+        return Ok(());
+    }
+    // UnityCN keys are 16 characters, not hex
+    if aes.len() == 16 {
+        let mount = uex_core::mount::Mount::open_no_keys(path).context("failed to open archive")?;
+        if !mount.has_unity_encrypted() {
+            anyhow::bail!("archive has no UnityCN-encrypted bundles to test against");
+        }
+        let ok = mount.test_unity_key(aes)?;
+        if ok {
+            println!("UnityCN key accepted (signature verified)");
+            Ok(())
+        } else {
+            anyhow::bail!("UnityCN key rejected: signature mismatch — wrong key for this bundle");
+        }
+    } else {
+        anyhow::bail!("invalid key: expected 64 hex chars (UE AES-256) or 16 characters (UnityCN)");
+    }
 }
 
 fn cmd_gen_testdata(out: &PathBuf, files: usize, file_mb: usize) -> Result<()> {

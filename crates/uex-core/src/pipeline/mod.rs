@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::mount::{Mount, SourceReader, VirtualFile};
 use crossbeam_channel::{bounded, Receiver};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,11 @@ pub struct ExtractOptions {
     pub convert: bool,
     /// populated by extract_parallel for sibling resolution during conversion
     pub sibling_map: std::sync::Arc<SiblingMap>,
+    /// set to true from another thread to stop extraction at the next file boundary
+    pub cancel: std::sync::Arc<AtomicBool>,
+    /// skip AES-encrypted entries instead of erroring on them
+    /// ("extract unencrypted only" fallback)
+    pub skip_encrypted: bool,
 }
 
 impl Default for ExtractOptions {
@@ -48,6 +53,8 @@ impl Default for ExtractOptions {
             threads: 0,
             convert: false,
             sibling_map: std::sync::Arc::new(std::collections::HashMap::new()),
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            skip_encrypted: false,
         }
     }
 }
@@ -66,6 +73,9 @@ pub fn plan<'a>(mount: &'a Mount, opts: &ExtractOptions) -> Vec<&'a VirtualFile>
     mount
         .files()
         .filter(|f| {
+            if opts.skip_encrypted && mount.is_file_encrypted(f) {
+                return false;
+            }
             if let Some(flt) = &opts.filter {
                 if !f.path.to_lowercase().contains(&flt.to_lowercase()) {
                     return false;
@@ -157,6 +167,9 @@ pub fn extract_parallel(
                 }
             };
             for vf in files {
+                if opts_arc.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     convert::extract_one(&mut reader, &vf, &opts_arc2)
                 }));
@@ -211,12 +224,13 @@ pub fn extract_parallel(
             rep.elapsed = start.elapsed();
             rep.errors = error_log.lock().unwrap().clone();
         }
+        let cancelled = opts_arc.cancel.load(Ordering::Relaxed);
         let _ = tx.send(ProgressEvent {
-            done: total,
+            done: done.load(Ordering::Relaxed),
             total,
             bytes_done: bytes_done.load(Ordering::Relaxed),
             bytes_total,
-            current: String::new(),
+            current: if cancelled { "__cancelled__".into() } else { String::new() },
             mbps: 0.0,
             eta_secs: 0.0,
             errors: errors.load(Ordering::Relaxed),

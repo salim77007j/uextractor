@@ -20,6 +20,7 @@ directories.workspace = true
 image.workspace = true
 rfd = "0.17.2"
 serde.workspace = true
+egui-phosphor = { version = "0.10", features = ["fill"] }
 x11rb = { version = "0.14.0", features = ["image"] }
 
 [features]

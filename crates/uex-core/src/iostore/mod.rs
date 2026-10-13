@@ -736,6 +736,18 @@ impl IoStoreReader {
         &self.container_name
     }
 
+    /// True when this container's payloads are AES-encrypted (container flag).
+    pub fn is_encrypted(&self) -> bool {
+        self.toc.container_flags & CONTAINER_FLAG_ENCRYPTED != 0
+    }
+
+    /// The encryption key GUID recorded in the TOC (empty when absent).
+    pub fn encryption_key_guid(&self) -> String {
+        let g = self.toc.encryption_key_guid;
+        format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15])
+    }
+
     pub fn has_global_names(&self) -> bool {
         !self.global_names.is_empty()
     }

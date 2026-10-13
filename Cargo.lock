@@ -831,6 +831,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1078,6 +1093,15 @@ dependencies = [
  "profiling",
  "smallvec",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80049258178b29a9807b15b5bcf3d60722a22a91d03bc9316935dec5ed5ed2e0"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -2002,6 +2026,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
 ]
 
 [[package]]
@@ -3499,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "uex-cli"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3512,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "uex-core"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3526,6 +3560,7 @@ dependencies = [
  "libloading",
  "log",
  "lz4_flex",
+ "lzma-rs",
  "memmap2",
  "rayon",
  "ruzstd",
@@ -3540,11 +3575,12 @@ dependencies = [
 
 [[package]]
 name = "uex-gui"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "crossbeam-channel",
  "directories",
  "eframe",
+ "egui-phosphor",
  "env_logger",
  "image",
  "log",
@@ -3557,10 +3593,11 @@ dependencies = [
 
 [[package]]
 name = "uex-testdata"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "lz4_flex",
  "serde_json",
  "uex-core",
 ]

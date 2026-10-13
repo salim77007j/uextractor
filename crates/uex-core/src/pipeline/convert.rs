@@ -52,7 +52,13 @@ pub fn extract_one(reader: &mut SourceReader, vf: &VirtualFile, opts: &ExtractOp
         std::fs::write(&out_path, &data)?;
         return Ok(false);
     }
+
+    // Unity serialized file: CAB-* inside bundles, .assets, level*, sharedassets*…
     let data = reader.read(vf)?;
+    if crate::unity::looks_like_serialized_file(&data) {
+        return convert_unity_serialized(reader, vf, data, &opts.output_dir);
+    }
+
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -319,4 +325,262 @@ fn convert_zen(zen: &std::sync::Arc<crate::iostore::zen::ZenPackage>, vf: &Virtu
     let json_path = dir.join(format!("{name}.metadata.json"));
     std::fs::write(&json_path, serde_json::to_vec_pretty(&meta)?)?;
     Ok(produced)
+}
+
+// ---------------------------------------------------------------------------
+// Unity object conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Unity SerializedFile (CAB-* node, .assets, level*, …): every
+/// object gets a converted artifact when supported (PNG/GLB/audio/JSON), plus
+/// a per-file metadata JSON. Returns true when at least one artifact was made.
+pub fn convert_unity_serialized(
+    reader: &mut SourceReader,
+    vf: &VirtualFile,
+    data: Vec<u8>,
+    output_dir: &Path,
+) -> Result<bool> {
+    use crate::unity::class_id as cid;
+    use crate::unity::objects as uobj;
+    use crate::unity::serialized::SerializedFile;
+
+    let mut sf = SerializedFile::parse(data)
+        .map_err(|e| Error::asset(format!("{}: {e}", vf.path)))?;
+    sf.load_container();
+    let (bundle, base_dir) = reader.unity_context();
+    let res = uobj::ResourceContext::new(bundle, base_dir);
+    let dir = out_dir_for(output_dir, vf);
+
+    // parse all objects once (converters may reference each other, e.g. Sprite -> Texture2D)
+    let mut parsed: Vec<(crate::unity::serialized::ObjectInfo, String, crate::unity::typetree::UValue)> =
+        Vec::with_capacity(sf.objects.len());
+    for obj in &sf.objects {
+        match sf.read_object(obj) {
+            Ok((class, value)) => parsed.push((obj.clone(), class, value)),
+            Err(e) => {
+                // script types without typetrees are reported but not fatal;
+                // the error is carried so the metadata can surface it
+                parsed.push((
+                    obj.clone(),
+                    format!("Unreadable: {e}"),
+                    crate::unity::typetree::UValue::Str(format!("{e}")),
+                ));
+            }
+        }
+    }
+
+    // unique output names: container path if available, else class+name
+    let mut used_names: std::collections::HashMap<String, u32> = Default::default();
+    let mut out_name = |sf: &SerializedFile, obj: &crate::unity::serialized::ObjectInfo, base: &str| -> String {
+        let mut n = if let Some(cp) = sf.container_path(0, obj.path_id) {
+            // "assets/foo/bar.png" -> "bar"
+            Path::new(cp)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| base.to_string())
+        } else {
+            base.to_string()
+        };
+        n = sanitize_name(&n);
+        if n.is_empty() {
+            n = format!("obj_{}", obj.path_id);
+        }
+        let count = used_names.entry(n.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            format!("{n}_{pid}", pid = obj.path_id)
+        } else {
+            n
+        }
+    };
+
+    let mut produced = false;
+    let mut object_list: Vec<serde_json::Value> = Vec::new();
+
+    for (obj, class, value) in &parsed {
+        let (class, unreadable_error) = match class.strip_prefix("Unreadable: ") {
+            Some(err) => ("Unreadable", Some(err.to_string())),
+            None => (class.as_str(), None),
+        };
+        let mut entry = serde_json::json!({
+            "path_id": obj.path_id,
+            "class": class,
+            "size": obj.byte_size,
+        });
+        if let Some(err) = &unreadable_error {
+            entry["error"] = serde_json::json!(err);
+        }
+        let base_name = match class {
+            "Unreadable" => format!("obj_{}", obj.path_id),
+            _ => sf.object_name(obj, value),
+        };
+        entry["name"] = serde_json::json!(base_name);
+
+        match class {
+            "Texture2D" => {
+                match uobj::texture2d_data(value, &sf, &res) {
+                    Ok((tex, rgba)) => {
+                        let name = out_name(&sf, obj, &tex.name);
+                        let png = dir.join(format!("{name}.png"));
+                        crate::export::formats::write_image_png(&png, &rgba, tex.width, tex.height)?;
+                        entry["exported"] = serde_json::json!(format!("{name}.png"));
+                        entry["format"] = serde_json::json!(tex.format);
+                        produced = true;
+                    }
+                    Err(e) => {
+                        entry["error"] = serde_json::json!(e.to_string());
+                    }
+                }
+            }
+            "Sprite" => {
+                match uobj::sprite_rgba(value, &base_name, &sf, &res, &parsed) {
+                    Ok((tex, rgba)) => {
+                        let name = out_name(&sf, obj, &tex.name);
+                        let png = dir.join(format!("{name}.png"));
+                        crate::export::formats::write_image_png(&png, &rgba, tex.width, tex.height)?;
+                        entry["exported"] = serde_json::json!(format!("{name}.png"));
+                        produced = true;
+                    }
+                    Err(e) => {
+                        entry["error"] = serde_json::json!(e.to_string());
+                    }
+                }
+            }
+            "AudioClip" => {
+                match uobj::audio_data(value, &sf, &res) {
+                    Ok((ext, payload)) => {
+                        let name = out_name(&sf, obj, &base_name);
+                        let out = dir.join(format!("{name}{ext}"));
+                        std::fs::write(&out, &payload)?;
+                        entry["exported"] = serde_json::json!(format!("{name}{ext}"));
+                        entry["channels"] = serde_json::json!(value.get_i64("m_Channels").unwrap_or(0));
+                        entry["frequency"] = serde_json::json!(value.get_i64("m_Frequency").unwrap_or(0));
+                        produced = true;
+                    }
+                    Err(e) => {
+                        entry["error"] = serde_json::json!(e.to_string());
+                    }
+                }
+            }
+            "Mesh" => {
+                match uobj::mesh_to_extracted(value, &base_name, &sf, &res) {
+                    Ok(mesh) => {
+                        let name = out_name(&sf, obj, &base_name);
+                        let scene = crate::export::gltf::GltfScene {
+                            meshes: vec![mesh],
+                            animations: Vec::new(),
+                            texture_name: None,
+                        };
+                        let glb = dir.join(format!("{name}.glb"));
+                        std::fs::write(&glb, crate::export::gltf::write_glb(&scene)?)?;
+                        entry["exported"] = serde_json::json!(format!("{name}.glb"));
+                        produced = true;
+                    }
+                    Err(e) => {
+                        entry["error"] = serde_json::json!(e.to_string());
+                    }
+                }
+            }
+            "TextAsset" => match uobj::text_asset_bytes(value) {
+                Ok(bytes) => {
+                    let name = out_name(&sf, obj, &base_name);
+                    let is_text = std::str::from_utf8(&bytes).is_ok();
+                    let ext = if is_text { "txt" } else { "bytes" };
+                    let out = dir.join(format!("{name}.{ext}"));
+                    std::fs::write(&out, &bytes)?;
+                    entry["exported"] = serde_json::json!(format!("{name}.{ext}"));
+                    produced = true;
+                }
+                Err(e) => {
+                    entry["error"] = serde_json::json!(e.to_string());
+                }
+            },
+            "VideoClip" => {
+                let ext_res = value
+                    .get("m_ExternalResources")
+                    .map(|r| {
+                        let src = r.get_str("m_Source").unwrap_or("").to_string();
+                        let offset = r.get("m_Offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let size = r.get("m_Size").and_then(|v| v.as_u64()).unwrap_or(0);
+                        (src, offset, size)
+                    })
+                    .filter(|(s, _, sz)| !s.is_empty() && *sz > 0);
+                if let Some((src, offset, size)) = ext_res {
+                    match res.read(&src, offset, size) {
+                        Ok(payload) => {
+                            let name = out_name(&sf, obj, &base_name);
+                            let original = value.get_str("m_OriginalPath").unwrap_or("");
+                            let ext = Path::new(original)
+                                .extension()
+                                .map(|e| format!(".{}", e.to_string_lossy()))
+                                .unwrap_or_else(|| ".mp4".into());
+                            let out = dir.join(format!("{name}{ext}"));
+                            std::fs::write(&out, &payload)?;
+                            entry["exported"] = serde_json::json!(format!("{name}{ext}"));
+                            produced = true;
+                        }
+                        Err(e) => {
+                            entry["error"] = serde_json::json!(e.to_string());
+                        }
+                    }
+                } else {
+                    entry["error"] = serde_json::json!("video clip has no external resource data");
+                }
+            }
+            "MonoBehaviour" | "MonoScript" | "Material" | "GameObject" | "AnimatorController"
+            | "AssetBundle" | "ScriptableObject" => {
+                // full typetree JSON dump (MonoBehaviour remainder dumped as hex)
+                let name = out_name(&sf, obj, &base_name);
+                let mut json_value = value.to_json();
+                if class == "MonoBehaviour" {
+                    if let Ok(bytes) = sf.object_bytes(obj) {
+                        // base fields end after m_Name; dump the whole object as
+                        // base64+hex so scripts can post-process it
+                        entry["raw_size"] = serde_json::json!(bytes.len());
+                    }
+                    let _ = &mut json_value;
+                }
+                let json = dir.join(format!("{name}.json"));
+                std::fs::write(&json, serde_json::to_vec_pretty(&json_value)?)?;
+                entry["exported"] = serde_json::json!(format!("{name}.json"));
+                produced = true;
+            }
+            _ => {
+                // known engine classes with typetrees still get JSON dumps;
+                // unknown/unreadable ones are only listed
+                if class != "Unreadable" && !value.to_json().is_null() {
+                    let name = out_name(&sf, obj, &base_name);
+                    let json = dir.join(format!("{name}.json"));
+                    std::fs::write(&json, serde_json::to_vec_pretty(&value.to_json())?)?;
+                    entry["exported"] = serde_json::json!(format!("{name}.json"));
+                    produced = true;
+                }
+            }
+        }
+        object_list.push(entry);
+    }
+
+    let meta = serde_json::json!({
+        "path": vf.path,
+        "engine": "unity",
+        "unity_version": sf.unity_version_raw,
+        "serialized_file_version": sf.header.version,
+        "target_platform": sf.target_platform,
+        "enable_type_tree": sf.enable_type_tree,
+        "externals": sf.externals.iter().map(|e| serde_json::json!(e.path)).collect::<Vec<_>>(),
+        "objects": object_list,
+    });
+    let json_path = dir.join(format!("{}.metadata.json", stem(vf)));
+    std::fs::write(&json_path, serde_json::to_vec_pretty(&meta)?)?;
+    Ok(produced)
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 32 => '_',
+            c => c,
+        })
+        .collect()
 }

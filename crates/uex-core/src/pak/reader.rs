@@ -288,8 +288,20 @@ impl<R: Read + Seek> PakReader<R> {
         // secondary indexes live outside the main index buffer
         let mut secondary: Vec<(String, Vec<u8>)> = Vec::new();
         let mut cursor = std::io::Cursor::new(&index_buf);
-        let mount_point = cursor.fstring()?;
-        let entry_count = cursor.u32()?;
+        // Parse with a wrong-key diagnosis: an encrypted index decrypted with the wrong
+        // key turns into high-entropy garbage and fails somewhere in these reads.
+        let wrong_key_hint = |e: Error| -> Error {
+            if footer.encrypted {
+                Error::Other(format!(
+                    "{e} — the pak index is AES-encrypted: the supplied key is most likely WRONG \
+                     (or no valid key was found). Verify the game's 64-hex-char AES key."
+                ))
+            } else {
+                e
+            }
+        };
+        let mount_point = cursor.fstring().map_err(wrong_key_hint)?;
+        let entry_count = cursor.u32().map_err(wrong_key_hint)?;
         let mut path_hash_seed = None;
 
         let (entries, phi_present, fdi_present) = if footer.version as u32 >= Version::V10 as u32 {
@@ -322,13 +334,13 @@ impl<R: Read + Seek> PakReader<R> {
                 }
                 secondary.push(("fdi".into(), fdi_buf));
             }
-            let encoded_size = cursor.u32()? as usize;
+            let encoded_size = cursor.u32().map_err(wrong_key_hint)? as usize;
 
-            let encoded = cursor.read_bytes(encoded_size)?;
-            let non_encoded_count = cursor.u32()? as usize;
+            let encoded = cursor.read_bytes(encoded_size).map_err(wrong_key_hint)?;
+            let non_encoded_count = cursor.u32().map_err(wrong_key_hint)? as usize;
             let mut non_encoded = Vec::with_capacity(non_encoded_count);
             for _ in 0..non_encoded_count {
-                non_encoded.push(PakEntry::read(&mut cursor, footer.version)?);
+                non_encoded.push(PakEntry::read(&mut cursor, footer.version).map_err(wrong_key_hint)?);
             }
 
             // Build path → entry from the full directory index
@@ -336,17 +348,21 @@ impl<R: Read + Seek> PakReader<R> {
                 .iter()
                 .find(|(k, _)| k == "fdi")
                 .map(|(_, v)| v.clone())
-                .ok_or_else(|| Error::malformed("pak has no full directory index"))?;
+                .ok_or_else(|| {
+                    wrong_key_hint(Error::malformed(
+                        "pak has no full directory index",
+                    ))
+                })?;
             let mut fdi = std::io::Cursor::new(fdi_buf);
-            let dir_count = fdi.u32()? as usize;
+            let dir_count = fdi.u32().map_err(wrong_key_hint)? as usize;
             let mut entries = BTreeMap::new();
             let mut encoded_reader = std::io::Cursor::new(encoded);
             for di in 0..dir_count {
-                let dir_name = fdi.fstring()?;
-                let file_count = fdi.u32()? as usize;
+                let dir_name = fdi.fstring().map_err(wrong_key_hint)?;
+                let file_count = fdi.u32().map_err(wrong_key_hint)? as usize;
                 for fi in 0..file_count {
-                    let file_name = fdi.fstring()?;
-                    let encoded_offset = fdi.i32()?;
+                    let file_name = fdi.fstring().map_err(wrong_key_hint)?;
+                    let encoded_offset = fdi.i32().map_err(wrong_key_hint)?;
                     if encoded_offset == i32::MIN {
                         continue; // deleted sentinel
                     }
@@ -372,11 +388,11 @@ impl<R: Read + Seek> PakReader<R> {
         } else {
             let mut entries = BTreeMap::new();
             if entry_count > 0x100_0000 {
-                return Err(Error::malformed("entry count out of range"));
+                return Err(wrong_key_hint(Error::malformed("entry count out of range")));
             }
             for _ in 0..entry_count {
-                let path = cursor.fstring()?;
-                let entry = PakEntry::read(&mut cursor, footer.version)?;
+                let path = cursor.fstring().map_err(wrong_key_hint)?;
+                let entry = PakEntry::read(&mut cursor, footer.version).map_err(wrong_key_hint)?;
                 entries.insert(path, entry);
             }
             (entries, false, false)
@@ -436,11 +452,19 @@ impl<R: Read + Seek> PakReader<R> {
             .ok_or_else(|| Error::NotFound(entry_path.to_string()))?
             .clone();
         let mut out = Vec::with_capacity(entry.uncompressed.min(1 << 30) as usize);
-        self.read_entry_into(&entry, &mut out)?;
+        self.read_entry_ctx(&entry, entry_path, &mut out)?;
         Ok(out)
     }
 
+    /// Path-less variant retained for compatibility with hot loops that already
+    /// resolved the entry (errors carry no entry name there).
     pub fn read_entry_into(&mut self, entry: &PakEntry, out: &mut Vec<u8>) -> Result<()> {
+        self.read_entry_ctx(entry, "<entry>", out)
+    }
+
+    /// Full read with entry-name context so decompression failures produce an
+    /// actionable message (missing/wrong AES key vs. corrupt data).
+    pub fn read_entry_ctx(&mut self, entry: &PakEntry, entry_path: &str, out: &mut Vec<u8>) -> Result<()> {
         if entry.is_deleted() {
             return Err(Error::malformed("entry is deleted"));
         }
@@ -455,7 +479,9 @@ impl<R: Read + Seek> PakReader<R> {
             entry.compressed
         } as usize;
 
-        let mut data = self.file.read_bytes(read_len)?;
+        let mut data = self.file.read_bytes(read_len).map_err(|e| {
+            Error::entry_read(entry_path, &e, entry.is_encrypted(), self.key.is_some())
+        })?;
         if entry.is_encrypted() {
             let key = self.key.as_ref().ok_or(Error::EncryptedNoKey)?;
             key.decrypt_ecb_in_place(&mut data);
@@ -493,7 +519,9 @@ impl<R: Read + Seek> PakReader<R> {
                     let src = &data[start..end];
                     let dst = &mut out[dst_off..];
                     let n = if dst.len() < chunk_size { dst.len() } else { chunk_size };
-                    let written = crate::compress::decompress(method, src, &mut dst[..n])?;
+                    let written = crate::compress::decompress(method, src, &mut dst[..n]).map_err(|e| {
+                        Error::entry_read(entry_path, &e, entry.is_encrypted(), self.key.is_some())
+                    })?;
                     dst_off += written;
                 }
                 out.truncate(dst_off);
