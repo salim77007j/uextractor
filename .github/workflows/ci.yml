@@ -55,7 +55,7 @@ jobs:
           test -f out_unity/test_unity/hero.png
           test -f out_unity/test_unity/quad.glb
           test -f out_unity/test_unity/bgm.fsb
-          test -f out_unity_sa/test_unity_standalone/hero.png
+          test -f out_unity_sa/hero.png
           ls -R out_zen out_tex out_mesh out_unity out_unity_sa
 
       - name: Upload binaries
