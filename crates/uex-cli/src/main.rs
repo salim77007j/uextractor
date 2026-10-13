@@ -95,6 +95,9 @@ enum Command {
         files: usize,
         #[arg(long, default_value_t = 1)]
         file_mb: usize,
+        /// Also generate Unity test data (UnityFS bundle + standalone .assets)
+        #[arg(long)]
+        unity: bool,
     },
     /// Benchmark extraction throughput on a generated archive
     Bench {
@@ -181,7 +184,7 @@ fn run(cli: &Cli) -> Result<()> {
             cmd_extract(path, out, filter.as_deref(), ext, *convert, *skip_encrypted, cli)
         }
         Command::TestKey { path, aes } => cmd_test_key(path, aes),
-        Command::GenTestdata { out, files, file_mb } => cmd_gen_testdata(out, *files, *file_mb),
+        Command::GenTestdata { out, files, file_mb, unity } => cmd_gen_testdata(out, *files, *file_mb, *unity),
         Command::Bench { size_mb, compression } => cmd_bench(*size_mb, compression),
     }
 }
@@ -329,7 +332,7 @@ fn cmd_test_key(path: &PathBuf, aes: &str) -> Result<()> {
     }
 }
 
-fn cmd_gen_testdata(out: &PathBuf, files: usize, file_mb: usize) -> Result<()> {
+fn cmd_gen_testdata(out: &PathBuf, files: usize, file_mb: usize, unity: bool) -> Result<()> {
     std::fs::create_dir_all(out)?;
     // plain pak
     let samples: Vec<uex_testdata::SampleFile> = (0..files)
@@ -376,6 +379,25 @@ fn cmd_gen_testdata(out: &PathBuf, files: usize, file_mb: usize) -> Result<()> {
         None,
     )?;
     std::fs::write(out.join("test_mesh.pak"), &meshpak)?;
+    if unity {
+        // UnityFS bundle (LZ4, 2019.4 layout) with the full sample object set:
+        // Texture2D + TextAsset + AudioClip(streamed from .resS) + Mesh + Sprite
+        // + GameObject + AssetBundle container map.
+        let (w, h) = (128i32, 128i32);
+        let rgba: Vec<u8> = (0..(w * h) as usize)
+            .flat_map(|i| {
+                let x = (i % w as usize) as u8;
+                let y = (i / w as usize) as u8;
+                [x * 2, y * 2, (x as u16 * y as u16 % 255) as u8, 255]
+            })
+            .collect();
+        let bundle = uex_testdata::unity::sample_bundle_rgba("T_UnitySample", &rgba, w, h, true);
+        std::fs::write(out.join("test_unity.bundle"), &bundle)?;
+        // standalone serialized file (level0/sharedassets0 equivalent, stripped trees)
+        let standalone = uex_testdata::unity::sample_standalone_serialized(&rgba, w, h);
+        std::fs::write(out.join("test_unity_standalone.assets"), &standalone)?;
+        println!("unity test data: test_unity.bundle, test_unity_standalone.assets");
+    }
     println!("test archives written to {}", out.display());
     Ok(())
 }

@@ -42,7 +42,7 @@ jobs:
       - name: Smoke-test CLI against synthetic archives
         shell: bash
         run: |
-          target/release/uex gen-testdata --out testdata --files 4 --file-mb 1
+          target/release/uex gen-testdata --out testdata --files 4 --file-mb 1 --unity
           target/release/uex info testdata/test_plain.pak
           target/release/uex list testdata/test_container.utoc
           target/release/uex extract testdata/test_plain.pak --out out_plain
@@ -50,7 +50,13 @@ jobs:
           target/release/uex extract testdata/test_container.utoc --convert auto --out out_zen
           target/release/uex extract testdata/test_textures.pak --convert auto --out out_tex
           target/release/uex extract testdata/test_mesh.pak --convert auto --out out_mesh
-          ls -R out_zen out_tex out_mesh
+          target/release/uex extract testdata/test_unity.bundle --convert auto --out out_unity
+          target/release/uex extract testdata/test_unity_standalone.assets --convert auto --out out_unity_sa
+          test -f out_unity/test_unity/hero.png
+          test -f out_unity/test_unity/quad.glb
+          test -f out_unity/test_unity/bgm.fsb
+          test -f out_unity_sa/test_unity_standalone/hero.png
+          ls -R out_zen out_tex out_mesh out_unity out_unity_sa
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
