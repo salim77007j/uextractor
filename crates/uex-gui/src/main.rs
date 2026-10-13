@@ -16,6 +16,13 @@ fn main() -> eframe::Result {
         (out_dir, args[i + 2].clone(), args.get(i + 3).cloned())
     });
 
+    // positional archive path: open it on the first frame
+    let positional = if autoshot.is_none() {
+        args.iter().skip(1).find(|a| !a.starts_with('-')).cloned()
+    } else {
+        None
+    };
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -39,6 +46,7 @@ fn main() -> eframe::Result {
             theme::install(&cc.egui_ctx);
             let mut app = app::App::new();
             app.autoshot = shot;
+            app.pending_open = positional.map(std::path::PathBuf::from);
             Ok(Box::new(app))
         }),
     )

@@ -235,6 +235,9 @@ pub struct App {
     // batch queue
     pub queue: Vec<String>,
 
+    // archive to open on the first frame (CLI argument)
+    pub pending_open: Option<PathBuf>,
+
     // automated screenshot mode
     pub autoshot: Option<AutoShot>,
 }
@@ -289,6 +292,7 @@ impl App {
             textures: HashMap::new(),
             key_prompt: None,
             queue: Vec::new(),
+            pending_open: None,
             autoshot: None,
         }
     }

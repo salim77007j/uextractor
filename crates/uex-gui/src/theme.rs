@@ -1,22 +1,29 @@
-//! UExtractor visual theme — professional dark palette inspired by modern game-dev
-//! tools (Unreal Editor / Figma dark). Single source of truth for colors + styles.
+//! UExtractor visual theme — simple, professional dark palette.
+//! Single source of truth for colors, fonts and widget styling.
+//!
+//! NOTE: no custom `TextStyle::Name(..)` entries are registered. Custom named
+//! styles are a footgun: any widget that resolves them before/without the
+//! theme install panics ("Failed to find Name(..) in Style::text_styles").
+//! All custom sizes go through `FontId` directly.
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
 pub struct Palette;
 
 impl Palette {
     // base surfaces
-    pub const BG: Color32 = Color32::from_rgb(0x13, 0x14, 0x1a);
-    pub const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1c, 0x24);
-    pub const PANEL_HEADER: Color32 = Color32::from_rgb(0x20, 0x23, 0x2d);
-    pub const CARD: Color32 = Color32::from_rgb(0x22, 0x25, 0x30);
-    pub const CARD_HOVER: Color32 = Color32::from_rgb(0x2a, 0x2e, 0x3b);
-    pub const WIDGET: Color32 = Color32::from_rgb(0x26, 0x29, 0x34);
-    pub const WIDGET_HOVER: Color32 = Color32::from_rgb(0x30, 0x34, 0x42);
-    pub const WIDGET_ACTIVE: Color32 = Color32::from_rgb(0x38, 0x3d, 0x4e);
+    pub const BG: Color32 = Color32::from_rgb(0x14, 0x15, 0x1a);
+    pub const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x21);
+    pub const PANEL_HEADER: Color32 = Color32::from_rgb(0x1d, 0x1e, 0x25);
+    pub const CARD: Color32 = Color32::from_rgb(0x22, 0x24, 0x2d);
+    pub const CARD_HOVER: Color32 = Color32::from_rgb(0x29, 0x2c, 0x37);
+    pub const WIDGET: Color32 = Color32::from_rgb(0x26, 0x28, 0x32);
+    pub const WIDGET_HOVER: Color32 = Color32::from_rgb(0x2f, 0x32, 0x3e);
+    pub const WIDGET_ACTIVE: Color32 = Color32::from_rgb(0x37, 0x3b, 0x49);
+    pub const ROW_SEL: Color32 = Color32::from_rgb(0x28, 0x38, 0x58); // selected table row
+    pub const PREVIEW_BG: Color32 = Color32::from_rgb(0x10, 0x11, 0x15);
 
-    // accents
+    // accents (used sparingly — one primary accent + semantics)
     pub const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x8c, 0xff); // UE blue
     pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x2c, 0x4a, 0x80);
     pub const ACCENT_TEXT: Color32 = Color32::from_rgb(0x8a, 0xb8, 0xff);
@@ -26,12 +33,16 @@ impl Palette {
     pub const RED: Color32 = Color32::from_rgb(0xff, 0x5c, 0x6c);
 
     // text
-    pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xf0);
-    pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xb0);
-    pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x66, 0x6c, 0x7c);
+    pub const TEXT: Color32 = Color32::from_rgb(0xe4, 0xe6, 0xed);
+    pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xf4, 0xf6, 0xfa);
+    pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x9d, 0xa3, 0xb2);
+    pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6b, 0x71, 0x80);
 
-    // type-icon colors
-    pub const C_PACKAGE: Color32 = Color32::from_rgb(0x7e, 0x9c, 0xff);
+    // hairlines / separators
+    pub const LINE: Color32 = Color32::from_rgb(0x2b, 0x2e, 0x39);
+
+    // type-icon colors (kept dimmer so the browser stays calm)
+    pub const C_PACKAGE: Color32 = Color32::from_rgb(0x82, 0xa0, 0xff);
     pub const C_IMAGE: Color32 = Color32::from_rgb(0x5f, 0xd6, 0xb2);
     pub const C_MESH: Color32 = Color32::from_rgb(0xff, 0xa9, 0x5f);
     pub const C_AUDIO: Color32 = Color32::from_rgb(0xe0, 0x7a, 0x9c);
@@ -75,7 +86,7 @@ pub mod ic {
     pub const CARET_DOWN: &str = fill::CARET_DOWN;
     pub const CARET_RIGHT: &str = fill::CARET_RIGHT;
     pub const CARET_UP: &str = fill::CARET_UP;
-    pub const CARET_SORT: &str = fill::CARET_UP;
+    pub const ARROW_RIGHT: &str = fill::ARROW_RIGHT;
     pub const CLOSE: &str = fill::X;
     pub const UNREAL: &str = fill::CUBE_TRANSPARENT;
     pub const UNITY: &str = fill::SPHERE;
@@ -84,10 +95,8 @@ pub mod ic {
     pub const LOCK: &str = fill::LOCK_KEY;
     pub const REFRESH: &str = fill::ARROW_CLOCKWISE;
     pub const TRASH: &str = fill::TRASH_SIMPLE;
-    pub const TABLE: &str = fill::TABLE;
     pub const TERMINAL: &str = fill::TERMINAL_WINDOW;
     pub const PLUS: &str = fill::PLUS;
-    pub const ARROW: &str = fill::ARROW_RIGHT;
     pub const PLAY: &str = fill::PLAY;
 }
 
@@ -100,92 +109,102 @@ pub fn install(ctx: &egui::Context) {
     // ---- spacing ----
     let mut style = (*ctx.style()).clone();
     let s = &mut style;
-    s.spacing.item_spacing = Vec2::new(8.0, 6.0);
-    s.spacing.button_padding = Vec2::new(9.0, 5.0);
-    s.spacing.menu_margin = Margin::same(6);
-    s.spacing.window_margin = Margin::same(12);
-    s.spacing.indent = 18.0;
+    s.spacing.item_spacing = Vec2::new(8.0, 4.0);
+    s.spacing.button_padding = Vec2::new(10.0, 5.0);
+    s.spacing.menu_margin = Margin::same(5);
+    s.spacing.window_margin = Margin::same(14);
+    s.spacing.indent = 14.0;
 
-    // ---- text sizes ----
-    use egui::FontId;
+    // ---- text sizes (standard styles only — no custom named styles) ----
     s.text_styles = [
-        (egui::TextStyle::Heading, FontId::proportional(21.0)),
-        (egui::TextStyle::Body, FontId::proportional(14.0)),
-        (egui::TextStyle::Button, FontId::proportional(14.0)),
+        (egui::TextStyle::Heading, FontId::proportional(17.0)),
+        (egui::TextStyle::Body, FontId::proportional(13.5)),
+        (egui::TextStyle::Button, FontId::proportional(13.5)),
         (egui::TextStyle::Small, FontId::proportional(11.5)),
-        (egui::TextStyle::Monospace, FontId::monospace(12.5)),
-        (egui::TextStyle::Name("Tab".into()), FontId::proportional(13.5)),
-        (egui::TextStyle::Name("Badge".into()), FontId::proportional(11.0)),
-    ].into_iter().collect();
+        (egui::TextStyle::Monospace, FontId::monospace(12.0)),
+    ]
+    .into_iter()
+    .collect();
 
     // ---- visuals ----
     let mut v = egui::Visuals::dark();
     v.panel_fill = Palette::PANEL;
     v.window_fill = Palette::PANEL;
     v.extreme_bg_color = Palette::BG; // scroll areas, text edit bg
-    v.faint_bg_color = Color32::from_rgb(0x1f, 0x21, 0x2a); // striped rows
+    v.faint_bg_color = Color32::from_rgb(0x1e, 0x20, 0x28); // striped rows
     v.override_text_color = Some(Palette::TEXT);
 
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(8);
     v.menu_corner_radius = CornerRadius::same(6);
 
     v.widgets.noninteractive.bg_fill = Palette::PANEL_HEADER;
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Palette::TEXT);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x33, 0x40));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Palette::LINE);
     v.widgets.noninteractive.corner_radius = CornerRadius::same(4);
 
     v.widgets.inactive.bg_fill = Palette::WIDGET;
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Palette::TEXT_WEAK);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd3, 0xdc));
     v.widgets.inactive.bg_stroke = Stroke::NONE;
-    v.widgets.inactive.corner_radius = CornerRadius::same(5);
+    v.widgets.inactive.corner_radius = CornerRadius::same(4);
 
     v.widgets.hovered.bg_fill = Palette::WIDGET_HOVER;
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Palette::TEXT);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Palette::ACCENT_DIM);
-    v.widgets.hovered.corner_radius = CornerRadius::same(5);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Palette::TEXT_STRONG);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Palette::LINE);
+    v.widgets.hovered.corner_radius = CornerRadius::same(4);
 
     v.widgets.active.bg_fill = Palette::WIDGET_ACTIVE;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, Palette::ACCENT_TEXT);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, Palette::ACCENT);
-    v.widgets.active.corner_radius = CornerRadius::same(5);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, Palette::TEXT_STRONG);
+    v.widgets.active.bg_stroke = Stroke::NONE;
+    v.widgets.active.corner_radius = CornerRadius::same(4);
 
     v.widgets.open.bg_fill = Palette::WIDGET;
     v.widgets.open.fg_stroke = Stroke::new(1.0, Palette::TEXT);
 
-    v.selection.bg_fill = Palette::ACCENT_DIM;
-    v.selection.stroke = Stroke::new(1.0, Palette::ACCENT_TEXT);
+    v.selection.bg_fill = Palette::ROW_SEL;
+    v.selection.stroke = Stroke::NONE;
 
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x33, 0x37, 0x45));
+    v.window_stroke = Stroke::new(1.0, Palette::LINE);
     v.window_shadow = egui::epaint::Shadow {
         offset: [0, 8],
-        blur: 28,
-        spread: 2,
-        color: Color32::from_black_alpha(120),
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(110),
     };
     v.popup_shadow = egui::epaint::Shadow {
         offset: [0, 4],
-        blur: 16,
+        blur: 14,
         spread: 0,
-        color: Color32::from_black_alpha(90),
+        color: Color32::from_black_alpha(80),
     };
     v.resize_corner_size = 12.0;
     style.visuals = v;
     ctx.set_style(style);
 }
 
-/// Small rounded badge (chips like "1 024 files", engine tags).
+/// Small rounded badge (chips like "ACTIVE", error counter).
+/// Uses a direct FontId — deliberately NOT a named text style.
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
     let galley_text = format!(" {text} ");
-    let font = egui::TextStyle::Name("Badge".into()).resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(galley_text, font, color);
+    let font = FontId::proportional(10.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(galley_text, font, Color32::WHITE.gamma_multiply(0.92));
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(galley.size().x + 8.0, galley.size().y + 4.0),
+        Vec2::new(galley.size().x + 6.0, galley.size().y + 4.0),
         egui::Sense::hover(),
     );
-    ui.painter().rect_filled(rect, 4.0, color.gamma_multiply(0.16));
     ui.painter()
-        .rect_stroke(rect, 4.0, Stroke::new(1.0, color.gamma_multiply(0.55)), egui::StrokeKind::Inside);
-    ui.painter().galley(rect.left_top() + Vec2::new(4.0, 2.0), galley, color);
+        .rect_filled(rect, 4.0, color.gamma_multiply(0.18));
+    ui.painter().galley(rect.left_top() + Vec2::new(3.0, 2.0), galley, Color32::WHITE.gamma_multiply(0.92));
+}
+
+/// Plain text counter, e.g. `2 files · 3.5 KB`. Not interactive-looking.
+pub fn counter(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.5)
+            .color(Palette::TEXT_FAINT),
+    );
 }
 
 /// Icon painted in a specific color (type icons in lists/trees).

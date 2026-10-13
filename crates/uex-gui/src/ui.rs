@@ -1,27 +1,18 @@
 //! All rendering: panels, tree, asset table, inspector, dialogs, theme usage.
+//!
+//! Design rules (v1.3):
+//! * one primary accent (UE blue); semantic colors only for status
+//! * standard egui text styles only — no custom named styles (panic-safe)
+//! * flat surfaces, hairline separators, calm hierarchy
 
 use eframe::egui;
-use egui::{Color32, RichText, Vec2};
+use egui::{Align2, Color32, FontId, RichText, Sense, Vec2};
 
 use crate::app::{
     file_name, file_type_name, format_size, mesh_preview_ui, type_icon, App, KeyEntry, KeyPrompt,
-    Status, PendingAction, Preview, SortCol, StatusKind, ViewMode, VirtualFile,
+    PendingAction, Preview, SortCol, Status, StatusKind, ViewMode, VirtualFile,
 };
-use crate::theme::{badge, ic, Palette};
-
-/// The default egui font lacks some common glyphs (arrow, carets); route them
-/// through phosphor so every label renders correctly.
-fn arrow_right() -> &'static str {
-    ic::ARROW
-}
-
-fn caret_up() -> &'static str {
-    ic::CARET_UP
-}
-
-fn caret_down() -> &'static str {
-    ic::CARET_DOWN
-}
+use crate::theme::{badge, counter, ic, Palette};
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -34,6 +25,10 @@ impl eframe::App for App {
             if let Some(p) = &f.path {
                 self.open_path(p.clone());
             }
+        }
+        // archive passed as CLI argument / queued on launch
+        if let Some(p) = self.pending_open.take() {
+            self.open_path(p);
         }
         if self.extracting {
             ctx.request_repaint();
@@ -74,39 +69,86 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(Palette::PANEL_HEADER)
-                    .inner_margin(egui::Margin::symmetric(10, 7)),
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // brand
+                    ui.add_space(2.0);
+                    // brand mark: rounded accent square with "U"
+                    let (mark, _) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
+                    ui.painter().rect_filled(mark, 5.0, Palette::ACCENT);
+                    ui.painter().text(
+                        mark.center(),
+                        Align2::CENTER_CENTER,
+                        "U",
+                        FontId::proportional(12.5),
+                        Color32::WHITE,
+                    );
                     ui.label(
                         RichText::new("UExtractor")
-                            .size(15.0)
+                            .size(13.5)
                             .strong()
-                            .color(Palette::ACCENT_TEXT),
+                            .color(Palette::TEXT_STRONG),
                     );
-                    ui.separator();
+                    ui.add_space(6.0);
 
-                    let open = icon_button(ui, ic::OPEN, "Open", "Open an archive (.pak, .utoc, .bundle, .assets, …)");
-                    if open.clicked() {
+                    // Open + recents chevron
+                    if ui
+                        .button(format!("{} Open", ic::OPEN))
+                        .on_hover_text("Open an archive (.pak, .utoc, .bundle, .assets, …)")
+                        .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Game archives", &["pak", "utoc", "bundle", "assetbundle", "unity3d", "assets"])
+                            .add_filter(
+                                "Game archives",
+                                &["pak", "utoc", "bundle", "assetbundle", "unity3d", "assets"],
+                            )
                             .add_filter("All files", &["*"])
                             .pick_file()
                         {
                             self.open_path(path);
                         }
                     }
+                    if !self.recent.is_empty() {
+                        ui.menu_button(RichText::new(ic::CARET_DOWN).size(11.0), |ui| {
+                            ui.set_min_width(260.0);
+                            ui.label(
+                                RichText::new("RECENT ARCHIVES")
+                                    .size(10.5)
+                                    .strong()
+                                    .color(Palette::TEXT_FAINT),
+                            );
+                            for r in self.recent.clone() {
+                                let (icon, color) = type_icon(&r);
+                                if ui
+                                    .button(
+                                        RichText::new(format!("{icon} {}", file_name(&r)))
+                                            .size(12.5)
+                                            .color(color),
+                                    )
+                                    .on_hover_text(&r)
+                                    .clicked()
+                                {
+                                    self.open_path(std::path::PathBuf::from(&r));
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Recently opened archives");
+                    }
 
+                    ui.add_space(4.0);
+
+                    // primary action
                     let can_extract = self.mount.is_some() && !self.extracting;
                     if ui
                         .add_enabled(
                             can_extract,
                             egui::Button::new(
-                                RichText::new(format!("{} Extract all", ic::EXTRACT)).size(14.0),
+                                RichText::new(format!("{} Extract all", ic::EXTRACT)).strong(),
                             )
-                            .fill(Palette::ACCENT_DIM)
-                            .stroke(egui::Stroke::new(1.0, Palette::ACCENT)),
+                            .fill(Palette::ACCENT),
                         )
                         .on_hover_text("Extract every file in the archive")
                         .clicked()
@@ -116,61 +158,65 @@ impl App {
                     if ui
                         .add_enabled(
                             can_extract && self.selected.is_some(),
-                            egui::Button::new(RichText::new(format!("{} Selected", ic::EXTRACT_ONE)).size(14.0)),
+                            egui::Button::new(format!("{} Selected", ic::EXTRACT_ONE)),
                         )
-                        .on_hover_text("Extract the file currently selected in the inspector")
+                        .on_hover_text("Extract the file selected in the inspector")
                         .clicked()
                     {
                         let sel = self.selected.clone();
                         self.extract_selected(sel);
                     }
 
-                    ui.separator();
+                    ui.add_space(6.0);
 
-                    // search box
-                    ui.label(RichText::new(ic::SEARCH).size(15.0).color(Palette::TEXT_WEAK));
+                    // search
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .desired_width(210.0)
-                            .hint_text("Filter files…")
-                            .font(egui::TextStyle::Body),
+                            .desired_width(230.0)
+                            .hint_text("Search files…"),
                     );
-                    if !self.filter.is_empty() && ui.small_button(RichText::new(ic::CLOSE).size(12.0)).clicked() {
+                    if !self.filter.is_empty()
+                        && ui
+                            .small_button(RichText::new(ic::CLOSE).size(11.0))
+                            .on_hover_text("Clear search")
+                            .clicked()
+                    {
                         self.filter.clear();
                     }
 
-                    ui.separator();
-                    ui.toggle_value(&mut self.convert, RichText::new("Convert").size(14.0))
-                        .on_hover_text("Convert assets on extract (textures → PNG/DDS, meshes → GLB, …)");
-
-                    ui.separator();
-                    if icon_button(ui, ic::KEYS, "Keys", "AES key manager — add or activate decryption keys").clicked() {
-                        self.show_keys = !self.show_keys;
-                    }
-                    if icon_button(ui, ic::SETTINGS, "Settings", "Export destination, formats and batch queue").clicked() {
-                        self.show_settings = !self.show_settings;
-                    }
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // engine badge
-                        if let Some((glyph, label, color)) = self.engine_badge() {
-                            badge(ui, &format!("{glyph} {label}"), color);
+                        if icon_button(ui, ic::SETTINGS, "Settings", "Export destination, formats and batch queue")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
                         }
-                        if !self.recent.is_empty() {
-                            egui::ComboBox::from_id_salt("recent")
-                                .selected_text(RichText::new(format!("{} Recent", ic::RECENT)).size(13.5))
-                                .show_ui(ui, |ui| {
-                                    for r in self.recent.clone() {
-                                        if ui
-                                            .selectable_label(false, RichText::new(file_name(&r)).size(13.0))
-                                            .on_hover_text(&r)
-                                            .clicked()
-                                        {
-                                            self.open_path(std::path::PathBuf::from(&r));
-                                        }
-                                    }
-                                });
+                        if icon_button(ui, ic::KEYS, "Keys", "AES key manager — add or activate decryption keys")
+                            .clicked()
+                        {
+                            self.show_keys = !self.show_keys;
                         }
+                        // segmented view toggle
+                        let list = self.view_mode == ViewMode::List;
+                        let seg = egui::Frame::default()
+                            .fill(Palette::CARD)
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::same(2));
+                        seg.show(ui, |ui| {
+                            if ui
+                                .selectable_label(list, RichText::new(ic::LIST).size(13.5))
+                                .on_hover_text("List view")
+                                .clicked()
+                            {
+                                self.view_mode = ViewMode::List;
+                            }
+                            if ui
+                                .selectable_label(!list, RichText::new(ic::GRID).size(13.5))
+                                .on_hover_text("Grid view")
+                                .clicked()
+                            {
+                                self.view_mode = ViewMode::Grid;
+                            }
+                        });
                     });
                 });
             });
@@ -184,64 +230,73 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(Palette::PANEL_HEADER)
-                    .inner_margin(egui::Margin::symmetric(10, 5)),
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // status dot + text
-                    let (glyph, color) = match self.status.kind {
-                        StatusKind::Info => (ic::INFO, Palette::TEXT_WEAK),
-                        StatusKind::Ok => (ic::OK, Palette::GREEN),
-                        StatusKind::Warn => (ic::WARNING, Palette::AMBER),
-                        StatusKind::Err => (ic::ERROR, Palette::RED),
-                        StatusKind::Busy => (ic::REFRESH, Palette::ACCENT),
-                    };
-                    ui.label(RichText::new(glyph).size(15.0).color(color));
-                    ui.label(RichText::new(&self.status.text).size(13.0).color(match self.status.kind {
-                        StatusKind::Err => Palette::RED,
-                        StatusKind::Warn => Palette::AMBER,
+                    // status dot
+                    let color = match self.status.kind {
+                        StatusKind::Info => Palette::TEXT_FAINT,
                         StatusKind::Ok => Palette::GREEN,
-                        _ => Palette::TEXT_WEAK,
-                    }));
+                        StatusKind::Warn => Palette::AMBER,
+                        StatusKind::Err => Palette::RED,
+                        StatusKind::Busy => Palette::ACCENT,
+                    };
+                    let (dot, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.0, color);
+                    ui.label(
+                        RichText::new(&self.status.text)
+                            .size(12.0)
+                            .color(match self.status.kind {
+                                StatusKind::Err => Palette::RED,
+                                StatusKind::Warn => Palette::AMBER,
+                                StatusKind::Ok => Palette::GREEN,
+                                _ => Palette::TEXT_WEAK,
+                            }),
+                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("v1.2.0")
-                                .small()
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(10.5)
                                 .color(Palette::TEXT_FAINT),
                         );
                         if n_errors > 0 {
-                            let btn = egui::Button::new(
+                            let chip = egui::Button::new(
                                 RichText::new(format!(
-                                    "{} {n_errors} error{}",
-                                    ic::ERROR,
-                                    if n_errors == 1 { "" } else { "s" }
+                                    "{} {n_errors}",
+                                    ic::ERROR
                                 ))
-                                .small()
+                                .size(10.5)
                                 .color(Palette::RED),
                             )
-                            .fill(Palette::RED.gamma_multiply(0.12))
-                            .stroke(egui::Stroke::new(1.0, Palette::RED.gamma_multiply(0.6)));
-                            if ui.add(btn).clicked() {
+                            .fill(Palette::RED.gamma_multiply(0.14))
+                            .corner_radius(4.0);
+                            if ui
+                                .add(chip)
+                                .on_hover_text("Show extraction errors")
+                                .clicked()
+                            {
                                 self.show_errors = true;
                             }
                         }
                         if let Some(ev) = &self.last_progress {
                             if self.extracting {
-                                let pct = if ev.total > 0 { ev.done as f32 / ev.total as f32 } else { 0.0 };
+                                let pct = if ev.total > 0 {
+                                    ev.done as f32 / ev.total as f32
+                                } else {
+                                    0.0
+                                };
                                 ui.add(
                                     egui::ProgressBar::new(pct)
-                                        .show_percentage()
-                                        .desired_width(200.0)
-                                        .desired_height(14.0),
+                                        .desired_width(150.0)
+                                        .desired_height(10.0),
                                 );
                                 ui.label(
-                                    RichText::new(format!(
-                                        "{:.1} MB/s · ETA {:.0}s",
-                                        ev.mbps, ev.eta_secs
-                                    ))
-                                    .small()
-                                    .color(Palette::TEXT_WEAK),
+                                    RichText::new(format!("{:.1} MB/s", ev.mbps))
+                                        .size(10.5)
+                                        .color(Palette::TEXT_WEAK),
                                 );
                             }
                         }
@@ -254,55 +309,80 @@ impl App {
 
     fn left_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("tree")
-            .default_width(300.0)
-            .width_range(220.0..=420.0)
-            .frame(egui::Frame::default().fill(Palette::PANEL).inner_margin(egui::Margin::same(8)))
+            .default_width(280.0)
+            .width_range(200.0..=420.0)
+            .frame(egui::Frame::default().fill(Palette::PANEL))
             .show(ctx, |ui| {
-                // header
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(ic::TREE).size(14.0).color(Palette::ACCENT_TEXT));
-                    ui.label(RichText::new("ARCHIVE").size(13.0).strong().color(Palette::TEXT_WEAK));
-                    if !self.archive_name.is_empty() {
-                        badge(ui, &format!("{} files", self.flat_files.len()), Palette::ACCENT_DIM);
-                    }
-                });
-                ui.add_space(4.0);
                 if self.mount.is_none() {
-                    ui.label(RichText::new("No archive loaded.").color(Palette::TEXT_FAINT));
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Supported: .pak · .utoc/.ucas · .bundle · .assets · data.unity3d")
-                            .small()
-                            .color(Palette::TEXT_FAINT),
-                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("No archive loaded")
+                                    .size(12.5)
+                                    .color(Palette::TEXT_FAINT),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Supported: .pak · .utoc/.ucas · .bundle · data.unity3d · .assets",
+                                )
+                                .size(11.0)
+                                .color(Palette::TEXT_FAINT),
+                            );
+                        });
+                    });
                     return;
                 }
-                ui.label(
-                    RichText::new(&self.archive_name)
-                        .size(13.0)
-                        .color(Palette::TEXT)
-                        .strong(),
-                )
-                .on_hover_text(&self.archive_name);
+
+                // header block
+                egui::Frame::default()
+                    .fill(Palette::PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(&self.archive_name)
+                                .size(13.0)
+                                .strong()
+                                .color(Palette::TEXT_STRONG),
+                        )
+                        .on_hover_text(&self.archive_name);
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if let Some((glyph, label, color)) = self.engine_badge() {
+                                ui.label(RichText::new(glyph).size(12.0).color(color));
+                                ui.label(
+                                    RichText::new(label).size(11.0).color(Palette::TEXT_WEAK),
+                                );
+                            }
+                            counter(ui, &format!("{} files", self.flat_files.len()));
+                        });
+                    });
                 ui.separator();
 
                 let mut to_select: Option<VirtualFile> = None;
                 let mut to_toggle: Option<String> = None;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
                     let selected_path = self.selected.as_ref().map(|s| s.path.clone());
                     let flt = self.filter.to_lowercase();
                     let mut tree = std::mem::take(&mut self.tree);
                     if !flt.is_empty() {
                         crate::app::filter_tree_pub(&mut tree, &flt);
                     }
-                    render_tree_nodes(
-                        ui,
-                        &tree,
-                        &mut self.expanded,
-                        selected_path.as_deref(),
-                        &mut to_select,
-                        &mut to_toggle,
-                    );
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            render_tree_nodes(
+                                ui,
+                                &tree,
+                                &mut self.expanded,
+                                selected_path.as_deref(),
+                                &mut to_select,
+                                &mut to_toggle,
+                            );
+                        });
                     self.tree = tree;
                 });
                 if let Some(p) = to_toggle {
@@ -323,35 +403,47 @@ impl App {
 
     fn center_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Palette::BG).inner_margin(egui::Margin::same(10)))
+            .frame(egui::Frame::default().fill(Palette::BG).inner_margin(egui::Margin::same(12)))
             .show(ctx, |ui| {
                 if self.mount.is_none() {
                     self.welcome(ui);
                     return;
                 }
+                // slim header row
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Assets").heading().strong());
-                    ui.separator();
-                    let list_sel = self.view_mode == ViewMode::List;
-                    if ui
-                        .selectable_label(list_sel, RichText::new(format!("{} List", ic::LIST)).size(14.0))
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::List;
-                    }
-                    if ui
-                        .selectable_label(!list_sel, RichText::new(format!("{} Grid", ic::GRID)).size(14.0))
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::Grid;
-                    }
+                    ui.label(RichText::new("Assets").size(14.5).strong().color(Palette::TEXT_STRONG));
+                    let total: u64 = self.flat_files.iter().map(|f| f.size).sum();
+                    counter(
+                        ui,
+                        &format!("{} files · {}", self.flat_files.len(), format_size(total)),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let total: u64 = self.flat_files.iter().map(|f| f.size).sum();
-                        badge(ui, &format!("{} files", self.flat_files.len()), Palette::ACCENT_DIM);
-                        badge(ui, &format_size(total), Palette::CARD_HOVER);
+                        let list = self.view_mode == ViewMode::List;
+                        let seg = egui::Frame::default()
+                            .fill(Palette::CARD)
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::same(2));
+                        seg.show(ui, |ui| {
+                            if ui
+                                .selectable_label(list, RichText::new(ic::LIST).size(13.5))
+                                .on_hover_text("List view")
+                                .clicked()
+                            {
+                                self.view_mode = ViewMode::List;
+                            }
+                            if ui
+                                .selectable_label(!list, RichText::new(ic::GRID).size(13.5))
+                                .on_hover_text("Grid view")
+                                .clicked()
+                            {
+                                self.view_mode = ViewMode::Grid;
+                            }
+                        });
                     });
                 });
-                ui.add_space(2.0);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
 
                 match self.view_mode {
                     ViewMode::List => self.asset_table(ui),
@@ -362,53 +454,94 @@ impl App {
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
-            ui.add_space(48.0);
-            ui.label(RichText::new(ic::UNREAL).size(64.0).color(Palette::ACCENT));
-            ui.add_space(6.0);
-            ui.label(RichText::new("UExtractor").size(38.0).strong().color(Palette::TEXT));
+            ui.add_space(56.0);
+            // logo mark
+            let (mark, _) = ui.allocate_exact_size(Vec2::new(56.0, 56.0), Sense::hover());
+            ui.painter().rect_filled(mark, 14.0, Palette::ACCENT);
+            ui.painter().text(
+                mark.center(),
+                Align2::CENTER_CENTER,
+                "U",
+                FontId::proportional(30.0),
+                Color32::WHITE,
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("UExtractor")
+                    .size(24.0)
+                    .strong()
+                    .color(Palette::TEXT_STRONG),
+            );
             ui.label(
                 RichText::new("Browse, preview and extract Unreal Engine & Unity game assets")
-                    .size(15.0)
+                    .size(13.5)
                     .color(Palette::TEXT_WEAK),
             );
-            ui.add_space(18.0);
+            ui.add_space(22.0);
 
             // drop card
-            let card = egui::Frame::default()
+            egui::Frame::default()
                 .fill(Palette::CARD)
-                .corner_radius(10.0)
-                .stroke(egui::Stroke::new(1.0, Palette::ACCENT_DIM))
-                .inner_margin(egui::Margin::symmetric(24, 14));
-            card.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(ic::DROP).size(22.0).color(Palette::ACCENT_TEXT));
-                    ui.label(RichText::new("Drop an archive here — .pak · .utoc/.ucas · .bundle · data.unity3d · .assets").size(14.0));
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, Palette::LINE))
+                .inner_margin(egui::Margin::symmetric(26, 13))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(ic::DROP).size(18.0).color(Palette::ACCENT_TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Drop an archive here, or click Open")
+                                .size(13.0)
+                                .color(Palette::TEXT),
+                        );
+                    });
                 });
+
+            ui.add_space(20.0);
+            // three feature hints in a row
+            let hints: [(&str, &str, Color32); 3] = [
+                (ic::UNREAL, "UE4 .pak & UE5 IOStore — models, textures, audio, data", Palette::ACCENT),
+                (ic::UNITY, "Unity bundles & serialized files — all engine versions", Palette::MAGENTA),
+                (ic::LOCK, "Encrypted archives? The AES key is requested before extraction", Palette::AMBER),
+            ];
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 32.0) / 3.0;
+                for (glyph, text, color) in hints {
+                    ui.allocate_ui(Vec2::new(w, 0.0), |ui| {
+                        ui.vertical(|ui| {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(glyph).size(16.0).color(color));
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(text).size(11.5).color(Palette::TEXT_WEAK));
+                        });
+                    });
+                }
             });
 
-            ui.add_space(18.0);
-            let hint = |ui: &mut egui::Ui, glyph: &str, color: Color32, text: &str| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(glyph).size(15.0).color(color));
-                    ui.label(RichText::new(text).size(13.5).color(Palette::TEXT_WEAK));
-                });
-            };
-            hint(ui, ic::OPEN, Palette::ACCENT, "Open an archive with the toolbar button, or drag & drop");
-            hint(ui, ic::LOCK, Palette::AMBER, "Encrypted archive? UExtractor asks for the AES key before extracting");
-            hint(ui, ic::EXTRACT, Palette::GREEN, "Extract everything, or pick files in the browser and extract selectively");
-            hint(ui, ic::MESH, Palette::C_MESH, "Preview textures and 3D meshes live before export");
-
             if !self.recent.is_empty() {
-                ui.add_space(20.0);
-                ui.label(RichText::new("RECENT").size(12.0).strong().color(Palette::TEXT_FAINT));
-                for r in self.recent.clone() {
-                    let (glyph, color) = type_icon(&r);
+                ui.add_space(26.0);
+                ui.label(
+                    RichText::new("RECENT")
+                        .size(10.5)
+                        .strong()
+                        .color(Palette::TEXT_FAINT),
+                );
+                ui.add_space(2.0);
+                let recents: Vec<String> = self.recent.iter().take(5).cloned().collect();
+                for r in &recents {
+                    let (glyph, color) = type_icon(r);
+                    let path = r.clone();
                     if ui
-                        .link(RichText::new(format!("{glyph} {}", file_name(&r))).size(13.0))
-                        .on_hover_text(&r)
+                        .link(
+                            RichText::new(format!("{glyph} {}", file_name(r)))
+                                .size(12.5)
+                                .color(color),
+                        )
+                        .on_hover_text(r)
                         .clicked()
                     {
-                        self.open_path(std::path::PathBuf::from(r));
+                        self.open_path(std::path::PathBuf::from(path));
                     }
                 }
             }
@@ -416,126 +549,140 @@ impl App {
     }
 
     fn asset_table(&mut self, ui: &mut egui::Ui) {
-        // header row
-        ui.horizontal(|ui| {
-            let sort_btn = |ui: &mut egui::Ui, label: &str, col: SortCol, w: f32| -> bool {
-                let active = self.sort_col == col;
-                let arrow = if active {
-                    if self.sort_asc { format!(" {}", caret_up()) } else { format!(" {}", caret_down()) }
-                } else {
-                    String::new()
-                };
-                ui.add_sized(
-                    [w, 20.0],
-                    egui::Button::new(
-                        RichText::new(format!("{label}{arrow}"))
-                            .size(12.5)
-                            .strong()
-                            .color(if active { Palette::ACCENT_TEXT } else { Palette::TEXT_WEAK }),
-                    )
-                    .fill(if active { Palette::CARD } else { Color32::TRANSPARENT }),
-                ).clicked()
-            };
-            let click_name = sort_btn(ui, "NAME", SortCol::Name, 380.0);
-            let click_type = sort_btn(ui, "TYPE", SortCol::Type, 110.0);
-            let click_size = sort_btn(ui, "SIZE", SortCol::Size, 90.0);
-            if click_name {
-                if self.sort_col == SortCol::Name { self.sort_asc = !self.sort_asc } else { self.sort_col = SortCol::Name; self.sort_asc = true }
-            }
-            if click_type {
-                if self.sort_col == SortCol::Type { self.sort_asc = !self.sort_asc } else { self.sort_col = SortCol::Type; self.sort_asc = true }
-            }
-            if click_size {
-                if self.sort_col == SortCol::Size { self.sort_asc = !self.sort_asc } else { self.sort_col = SortCol::Size; self.sort_asc = true }
-            }
-        });
-        ui.separator();
+        // local sort copies so header + body closures don't fight over `self`
+        let mut sort_col = self.sort_col;
+        let mut sort_asc = self.sort_asc;
 
         let files = self.table_files();
         let sel_path = self.selected.as_ref().map(|s| s.path.clone());
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("assets_grid")
-                .num_columns(3)
-                .striped(true)
-                .min_col_width(90.0)
-                .start_row(0)
-                .show(ui, |ui| {
-                    let mut clicked: Option<VirtualFile> = None;
-                    for f in &files {
-                        let (icon, color) = type_icon(&f.path);
+        let mut to_select: Option<VirtualFile> = None;
+
+        // zero horizontal cell spacing so the row highlight is continuous
+        ui.allocate_ui(ui.available_size(), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            egui_extras::TableBuilder::new(ui)
+                .striped(false)
+                .vscroll(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(egui_extras::Column::remainder().resizable(true).clip(true))
+                .column(egui_extras::Column::auto())
+                .column(egui_extras::Column::auto())
+                .header(26.0, |mut header| {
+                    // Name
+                    header.col(|ui| {
+                        if sort_header(ui, "Name", sort_col == SortCol::Name, sort_asc, false)
+                            .clicked()
+                        {
+                            if sort_col == SortCol::Name { sort_asc = !sort_asc } else { sort_col = SortCol::Name; sort_asc = true }
+                        }
+                    });
+                    // Type
+                    header.col(|ui| {
+                        if sort_header(ui, "Type", sort_col == SortCol::Type, sort_asc, false)
+                            .clicked()
+                        {
+                            if sort_col == SortCol::Type { sort_asc = !sort_asc } else { sort_col = SortCol::Type; sort_asc = true }
+                        }
+                    });
+                    // Size
+                    header.col(|ui| {
+                        if sort_header(ui, "Size", sort_col == SortCol::Size, sort_asc, true)
+                            .clicked()
+                        {
+                            if sort_col == SortCol::Size { sort_asc = !sort_asc } else { sort_col = SortCol::Size; sort_asc = true }
+                        }
+                    });
+                })
+                .body(|mut body| {
+                    body.rows(26.0, files.len(), |mut row| {
+                        let f = &files[row.index()];
                         let selected = sel_path.as_ref() == Some(&f.path);
-                        if ui
-                            .selectable_label(
-                                selected,
-                                RichText::new(icon).size(15.0).color(color),
-                            )
-                            .clicked()
-                        {
-                            clicked = Some(f.clone());
-                        }
-                        if ui
-                            .selectable_label(
-                                selected,
-                                RichText::new(file_name(&f.path)).monospace().size(12.5),
-                            )
-                            .on_hover_text(&f.path)
-                            .clicked()
-                        {
-                            clicked = Some(f.clone());
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        row.set_selected(selected);
+                        // name cell: icon + filename
+                        row.col(|ui| {
+                            ui.add_space(8.0);
+                            let (icon, color) = type_icon(&f.path);
+                            ui.label(RichText::new(icon).size(14.0).color(color));
+                            ui.add_space(7.0);
+                            let name = RichText::new(file_name(&f.path))
+                                .size(12.5)
+                                .color(if selected { Palette::TEXT_STRONG } else { Palette::TEXT });
+                            ui.add(egui::Label::new(name).truncate()).on_hover_text(&f.path);
+                        });
+                        // type cell
+                        row.col(|ui| {
+                            ui.add_space(10.0);
                             ui.label(
-                                RichText::new(format_size(f.size))
-                                    .small()
+                                RichText::new(file_type_name(&f.path))
+                                    .size(12.0)
                                     .color(Palette::TEXT_WEAK),
                             );
-                            ui.label(RichText::new(file_type_name(&f.path)).small().color(Palette::TEXT_FAINT));
                         });
-                        ui.end_row();
-                    }
-                    if let Some(vf) = clicked {
-                        self.selected = Some(vf.clone());
-                        self.load_preview(ui.ctx(), &vf);
-                    }
+                        // size cell (right-aligned)
+                        row.col(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new(format_size(f.size))
+                                        .size(12.0)
+                                        .color(Palette::TEXT_WEAK),
+                                );
+                            });
+                        });
+                        if row.response().clicked() {
+                            to_select = Some(f.clone());
+                        }
+                    });
                 });
         });
+
+        self.sort_col = sort_col;
+        self.sort_asc = sort_asc;
+        if let Some(vf) = to_select {
+            self.selected = Some(vf.clone());
+            self.load_preview(ui.ctx(), &vf);
+        }
     }
 
     fn asset_grid(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let files = self.table_files();
-        let card_w = 136.0;
-        let cols = (ui.available_width() / card_w).max(1.0) as usize;
+        let card_w = 132.0;
+        let cols = ((ui.available_width() / card_w).max(1.0) as usize).max(1);
         let sel_path = self.selected.as_ref().map(|s| s.path.clone());
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
             egui::Grid::new("assets_cards").num_columns(cols).show(ui, |ui| {
                 for f in &files {
                     ui.vertical(|ui| {
                         let selected = sel_path.as_ref() == Some(&f.path);
                         let (icon, color) = type_icon(&f.path);
                         let thumb: Option<&egui::TextureHandle> = self.textures.get(&f.path);
-                        let cell = ui.allocate_ui(Vec2::new(card_w - 8.0, 118.0), |ui| {
+                        let cell = ui.allocate_ui(Vec2::new(card_w - 8.0, 112.0), |ui| {
                             let frame = egui::Frame::default()
-                                .fill(if selected { Palette::ACCENT_DIM } else { Palette::CARD })
-                                .corner_radius(6.0)
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    if selected { Palette::ACCENT } else { Color32::TRANSPARENT },
-                                ))
+                                .fill(if selected { Palette::ROW_SEL } else { Palette::CARD })
+                                .corner_radius(5.0)
                                 .inner_margin(4.0);
                             frame.show(ui, |ui| {
                                 if let Some(tex) = thumb {
-                                    ui.image(egui::load::SizedTexture::new(tex.id(), Vec2::new(116.0, 84.0)));
+                                    ui.image(egui::load::SizedTexture::new(
+                                        tex.id(),
+                                        Vec2::new(card_w - 16.0, 78.0),
+                                    ));
                                 } else {
                                     ui.vertical_centered(|ui| {
-                                        ui.add_space(22.0);
-                                        ui.label(RichText::new(icon).size(34.0).color(color));
-                                        ui.add_space(14.0);
+                                        ui.add_space(20.0);
+                                        ui.label(RichText::new(icon).size(30.0).color(color));
+                                        ui.add_space(12.0);
                                     });
                                 }
                                 ui.add_sized(
-                                    [card_w - 12.0, 14.0],
-                                    egui::Label::new(RichText::new(file_name(&f.path)).small().color(Palette::TEXT))
-                                        .truncate(),
+                                    [card_w - 14.0, 14.0],
+                                    egui::Label::new(
+                                        RichText::new(file_name(&f.path))
+                                            .small()
+                                            .color(Palette::TEXT),
+                                    )
+                                    .truncate(),
                                 );
                             });
                         });
@@ -554,88 +701,178 @@ impl App {
 
     fn right_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("details")
-            .default_width(380.0)
+            .default_width(360.0)
             .width_range(280.0..=520.0)
-            .frame(egui::Frame::default().fill(Palette::PANEL).inner_margin(egui::Margin::same(10)))
+            .frame(egui::Frame::default().fill(Palette::PANEL))
             .show(ctx, |ui| {
-                ui.label(RichText::new("INSPECTOR").size(13.0).strong().color(Palette::TEXT_WEAK));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("INSPECTOR")
+                            .size(10.5)
+                            .strong()
+                            .color(Palette::TEXT_FAINT),
+                    );
+                });
+                ui.add_space(4.0);
                 ui.separator();
 
                 let Some(vf) = self.selected.clone() else {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Select an asset to inspect and preview.").color(Palette::TEXT_FAINT));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("Select an asset to inspect and preview.")
+                                .size(12.0)
+                                .color(Palette::TEXT_FAINT),
+                        );
+                    });
                     return;
                 };
 
-                let (icon, color) = type_icon(&vf.path);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(icon).size(22.0).color(color));
-                    ui.label(RichText::new(file_name(&vf.path)).size(15.0).strong());
-                });
-                ui.label(RichText::new(&vf.path).monospace().small().color(Palette::TEXT_WEAK));
-
-                ui.add_space(6.0);
-                // metadata grid
-                egui::Grid::new("meta").num_columns(2).striped(true).show(ui, |ui| {
-                    meta_row(ui, "Type", file_type_name(&vf.path).to_string());
-                    meta_row(ui, "Size", format_size(vf.size));
-                    if let Some(m) = &self.mount {
-                        meta_row(ui, "Source", file_name(&m.source_path(vf.source)).to_string());
-                    }
-                    let encrypted = self.mount.as_ref().map(|m| m.is_file_encrypted(&vf)).unwrap_or(false);
-                    if encrypted {
-                        ui.label(RichText::new("Encryption").small().color(Palette::TEXT_FAINT));
-                        ui.label(RichText::new(format!("{} AES-256", ic::LOCK)).small().color(Palette::AMBER));
-                        ui.end_row();
-                    }
-                });
-                ui.separator();
-
-                match &mut self.preview {
-                    Preview::None => {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("No preview loaded.").color(Palette::TEXT_FAINT));
-                    }
-                    Preview::Texture(tex) => {
-                        let avail = ui.available_width();
-                        let frame = egui::Frame::default()
-                            .fill(Color32::from_rgb(0x10, 0x11, 0x16))
-                            .corner_radius(6.0)
-                            .inner_margin(6.0);
-                        frame.show(ui, |ui| {
-                            ui.image(egui::load::SizedTexture::new(tex.id(), Vec2::new(avail - 16.0, (avail - 16.0) * 0.75)));
-                        });
-                        ui.caption("Texture preview (decoded)");
-                    }
-                    Preview::Mesh { mesh, rot_x, rot_y, zoom } => {
-                        let (rx_, ry_, z_) = (rot_x, rot_y, zoom);
-                        mesh_preview_ui(ui, mesh, rx_, ry_, z_);
-                        ui.caption("Drag to rotate · scroll to zoom");
-                    }
-                    Preview::Text(t) => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink(false)
-                            .max_height(ui.available_height() - 60.0)
-                            .show(ui, |ui| {
-                                ui.monospace(RichText::new(t.as_str()).size(11.5).color(Palette::TEXT));
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            let (icon, color) = type_icon(&vf.path);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon).size(19.0).color(color));
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(file_name(&vf.path))
+                                        .size(14.0)
+                                        .strong()
+                                        .color(Palette::TEXT_STRONG),
+                                );
                             });
-                    }
-                    Preview::Unsupported(t) => {
-                        ui.label(RichText::new(t.as_str()).weak());
-                    }
-                }
+                            ui.label(
+                                RichText::new(&vf.path)
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(Palette::TEXT_FAINT),
+                            );
 
+                            ui.add_space(6.0);
+                            egui::Grid::new("meta")
+                                .num_columns(2)
+                                .spacing([16.0, 2.0])
+                                .show(ui, |ui| {
+                                    meta_row(ui, "Type", file_type_name(&vf.path).to_string());
+                                    meta_row(ui, "Size", format_size(vf.size));
+                                    if let Some(m) = &self.mount {
+                                        meta_row(
+                                            ui,
+                                            "Source",
+                                            file_name(&m.source_path(vf.source)).to_string(),
+                                        );
+                                    }
+                                    let encrypted = self
+                                        .mount
+                                        .as_ref()
+                                        .map(|m| m.is_file_encrypted(&vf))
+                                        .unwrap_or(false);
+                                    if encrypted {
+                                        ui.label(
+                                            RichText::new("Encryption")
+                                                .small()
+                                                .color(Palette::TEXT_FAINT),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("{} AES-256", ic::LOCK))
+                                                .small()
+                                                .color(Palette::AMBER),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                    // preview section
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("PREVIEW")
+                                .size(10.5)
+                                .strong()
+                                .color(Palette::TEXT_FAINT),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::symmetric(12, 2))
+                        .show(ui, |ui| {
+                            match &mut self.preview {
+                                Preview::None => {
+                                    ui.label(
+                                        RichText::new("Loading…")
+                                            .size(12.0)
+                                            .color(Palette::TEXT_FAINT),
+                                    );
+                                }
+                                Preview::Texture(tex) => {
+                                    let avail = ui.available_width() - 24.0;
+                                    egui::Frame::default()
+                                        .fill(Palette::PREVIEW_BG)
+                                        .corner_radius(5.0)
+                                        .inner_margin(6.0)
+                                        .show(ui, |ui| {
+                                            ui.image(egui::load::SizedTexture::new(
+                                                tex.id(),
+                                                Vec2::new(avail, avail * 0.75),
+                                            ));
+                                        });
+                                    ui.caption("Decoded texture");
+                                }
+                                Preview::Mesh { mesh, rot_x, rot_y, zoom } => {
+                                    mesh_preview_ui(ui, mesh, rot_x, rot_y, zoom);
+                                    ui.caption("Drag to rotate · scroll to zoom");
+                                }
+                                Preview::Text(t) => {
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink(false)
+                                        .id_salt("preview_text")
+                                        .max_height(ui.available_height() - 50.0)
+                                        .show(ui, |ui| {
+                                            ui.monospace(
+                                                RichText::new(t.as_str())
+                                                    .size(11.0)
+                                                    .color(Palette::TEXT),
+                                            );
+                                        });
+                                }
+                                Preview::Unsupported(t) => {
+                                    ui.label(
+                                        RichText::new(t.as_str())
+                                            .size(12.0)
+                                            .color(Palette::TEXT_FAINT),
+                                    );
+                                }
+                            }
+                        });
+                });
+
+                // action footer
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(6.0);
-                    let btn = egui::Button::new(
-                        RichText::new(format!("{} Extract this file", ic::EXTRACT_ONE)).size(14.0).strong(),
-                    )
-                    .fill(Palette::ACCENT)
-                    .min_size(Vec2::new(ui.available_width(), 30.0));
-                    if ui.add(btn).clicked() {
-                        let sel = self.selected.clone();
-                        self.extract_selected(sel);
-                    }
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            let w = ui.available_width();
+                            let btn = egui::Button::new(
+                                RichText::new(format!("{} Extract file", ic::EXTRACT_ONE))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Palette::ACCENT)
+                            .corner_radius(5.0)
+                            .min_size(Vec2::new(w, 30.0));
+                            if ui.add(btn).clicked() {
+                                let sel = self.selected.clone();
+                                self.extract_selected(sel);
+                            }
+                        });
                 });
             });
     }
@@ -662,24 +899,31 @@ impl App {
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .default_width(560.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new(&prompt.reason).size(14.0));
+            ui.add_space(2.0);
+            ui.label(RichText::new(&prompt.reason).size(13.0));
             if let Some(guid) = &prompt.guid_hint {
                 ui.label(
                     RichText::new(format!("Archive key GUID: {guid}"))
-                        .small()
+                        .size(11.0)
                         .color(Palette::TEXT_FAINT),
                 );
             }
             ui.add_space(8.0);
-            ui.label(RichText::new("Encryption key (64 hex characters): ").size(13.0));
-            let input = egui::TextEdit::singleline(&mut prompt.input)
-                .desired_width(560.0)
-                .font(egui::TextStyle::Monospace)
-                .hint_text("0x… paste the game's AES-256 key");
-            ui.add(input);
+            ui.label(
+                RichText::new("Encryption key (64 hex characters)")
+                    .size(11.0)
+                    .strong()
+                    .color(Palette::TEXT_WEAK),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut prompt.input)
+                    .desired_width(ui.available_width())
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("0x… paste the game's AES-256 key"),
+            );
             ui.horizontal(|ui| {
                 let len = prompt
                     .input
@@ -690,46 +934,50 @@ impl App {
                 if valid {
                     ui.label(
                         RichText::new(format!("{} Valid 32-byte key", ic::OK))
-                            .small()
+                            .size(11.0)
                             .color(Palette::GREEN),
                     );
                 } else {
                     ui.label(
                         RichText::new(format!("{len}/64 hex characters"))
-                            .small()
+                            .size(11.0)
                             .color(if len == 64 { Palette::RED } else { Palette::TEXT_FAINT }),
                     );
                 }
             });
             if let Some(err) = &prompt.error {
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.label(
                     RichText::new(format!("{} {err}", ic::ERROR))
-                        .small()
+                        .size(11.0)
                         .color(Palette::RED),
                 );
             }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                save = ui
-                    .add(
-                        egui::Button::new(RichText::new(format!("{} Save key & continue", ic::OK)).strong())
-                            .fill(Palette::ACCENT)
-                            .min_size(Vec2::new(190.0, 28.0)),
-                    )
-                    .clicked();
-                // "extract unencrypted only" is only meaningful when the archive is
-                // already open and only PART of it is encrypted
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                cancel = ui.button("Cancel").clicked();
+                // "extract unencrypted only" only makes sense when the archive is
+                // open and only PART of it is encrypted
                 if let Some(mount) = &self.mount {
                     let enc = mount.encrypted_file_count();
                     if enc > 0 && enc < mount.file_count() as u64 {
                         extract_unenc = ui
-                            .button(format!("{} Extract unencrypted only", ic::EXTRACT))
+                            .button(format!("{} Unencrypted only", ic::EXTRACT))
                             .on_hover_text("Skip encrypted files — extract what is readable now")
                             .clicked();
                     }
                 }
-                cancel = ui.button("Cancel").clicked();
+                save = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{} Save key & continue", ic::OK))
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Palette::ACCENT)
+                        .corner_radius(5.0),
+                    )
+                    .clicked();
             });
         });
 
@@ -757,10 +1005,8 @@ impl App {
             prompt.error = Some("Key must be exactly 64 hex characters (32 bytes).".into());
         }
         if extract_unenc {
-            let action = prompt.action;
             self.status = Status::new(StatusKind::Info, "Skipping encrypted files.");
             self.start_extraction(None, true);
-            let _ = action;
             return;
         }
         self.key_prompt = Some(prompt);
@@ -783,7 +1029,7 @@ impl App {
 
     fn progress_window(&mut self, ctx: &egui::Context) {
         let mut cancel = false;
-        egui::Window::new(RichText::new(format!("{} Extracting…", ic::EXTRACT)).heading().strong())
+        egui::Window::new(RichText::new(format!("{} Extracting", ic::EXTRACT)).heading().strong())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -40.0])
@@ -794,15 +1040,18 @@ impl App {
                         egui::ProgressBar::new(pct)
                             .show_percentage()
                             .desired_width(420.0)
-                            .desired_height(18.0),
+                            .desired_height(16.0),
                     );
                     ui.add_space(4.0);
-                    egui::Grid::new("prog_stats").num_columns(2).show(ui, |ui| {
-                        prog_row(ui, "Files", format!("{} / {}", ev.done, ev.total));
-                        prog_row(ui, "Speed", format!("{:.1} MB/s", ev.mbps));
-                        prog_row(ui, "ETA", format!("{:.0}s", ev.eta_secs));
-                        prog_row(ui, "Errors", ev.errors.to_string());
-                    });
+                    egui::Grid::new("prog_stats")
+                        .num_columns(2)
+                        .spacing([16.0, 2.0])
+                        .show(ui, |ui| {
+                            prog_row(ui, "Files", format!("{} / {}", ev.done, ev.total));
+                            prog_row(ui, "Speed", format!("{:.1} MB/s", ev.mbps));
+                            prog_row(ui, "ETA", format!("{:.0}s", ev.eta_secs));
+                            prog_row(ui, "Errors", ev.errors.to_string());
+                        });
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(if ev.current.len() > 60 {
@@ -811,17 +1060,22 @@ impl App {
                             ev.current.clone()
                         })
                         .monospace()
-                        .small()
-                        .color(Palette::TEXT_WEAK),
+                        .size(10.5)
+                        .color(Palette::TEXT_FAINT),
                     );
                 }
                 ui.add_space(6.0);
-                cancel = ui
-                    .add(
-                        egui::Button::new(RichText::new(format!("{} Cancel extraction", ic::CANCEL)).color(Palette::RED))
-                            .stroke(egui::Stroke::new(1.0, Palette::RED.gamma_multiply(0.6))),
-                    )
-                    .clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    cancel = ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{} Cancel", ic::CANCEL))
+                                    .color(Palette::RED),
+                            )
+                            .corner_radius(5.0),
+                        )
+                        .clicked();
+                });
             });
         if cancel {
             self.cancel_extraction();
@@ -843,14 +1097,22 @@ impl App {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(560.0)
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Keys decrypt encrypted archives. The active key is used when opening and extracting.")
-                        .color(Palette::TEXT_WEAK),
+                    RichText::new(
+                        "Keys decrypt encrypted archives. The active key is used when opening and extracting.",
+                    )
+                    .size(12.0)
+                    .color(Palette::TEXT_WEAK),
                 );
                 ui.separator();
                 if keys.is_empty() {
-                    ui.label(RichText::new("No keys saved yet.").color(Palette::TEXT_FAINT));
+                    ui.label(
+                        RichText::new("No keys saved yet.")
+                            .size(12.0)
+                            .color(Palette::TEXT_FAINT),
+                    );
                 }
                 for key in &keys {
                     ui.horizontal(|ui| {
@@ -863,9 +1125,13 @@ impl App {
                         } else {
                             key.hex.clone()
                         };
-                        ui.monospace(RichText::new(shown).small().color(Palette::TEXT_WEAK));
+                        ui.monospace(RichText::new(shown).size(10.5).color(Palette::TEXT_FAINT));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button(RichText::new(ic::TRASH).size(12.0)).on_hover_text("Remove key").clicked() {
+                            if ui
+                                .small_button(RichText::new(ic::TRASH).size(11.0))
+                                .on_hover_text("Remove key")
+                                .clicked()
+                            {
                                 remove = Some(key.name.clone());
                             }
                             if active {
@@ -875,16 +1141,29 @@ impl App {
                     });
                 }
                 ui.separator();
-                ui.label(RichText::new("Add key").strong());
+                ui.label(
+                    RichText::new("ADD KEY")
+                        .size(10.5)
+                        .strong()
+                        .color(Palette::TEXT_FAINT),
+                );
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut add_name).hint_text("Name"));
-                    ui.add_sized([380.0, 22.0], egui::TextEdit::singleline(&mut add_hex).hint_text("64 hex characters").font(egui::TextStyle::Monospace));
+                    ui.add_sized([140.0, 24.0], egui::TextEdit::singleline(&mut add_name).hint_text("Name"));
+                    ui.add_sized(
+                        [ui.available_width(), 24.0],
+                        egui::TextEdit::singleline(&mut add_hex)
+                            .hint_text("64 hex characters")
+                            .font(egui::TextStyle::Monospace),
+                    );
                 });
+                ui.add_space(4.0);
                 add = ui
-                    .add(egui::Button::new(format!("{} Add key", ic::PLUS)).min_size(Vec2::new(110.0, 24.0)))
+                    .add(
+                        egui::Button::new(format!("{} Add key", ic::PLUS)).corner_radius(5.0),
+                    )
                     .clicked();
                 if !self.archive_name.is_empty() {
-                    ui.add_space(4.0);
                     reload_archive = ui
                         .button(format!("{} Reload archive with active key", ic::REFRESH))
                         .clicked();
@@ -902,7 +1181,14 @@ impl App {
             }
         }
         if add && !add_name.is_empty() && KeyPrompt::input_valid(&add_hex) {
-            keys.push(KeyEntry { name: add_name, hex: add_hex.trim().trim_start_matches("0x").replace(['-', ' '], "").to_lowercase() });
+            keys.push(KeyEntry {
+                name: add_name,
+                hex: add_hex
+                    .trim()
+                    .trim_start_matches("0x")
+                    .replace(['-', ' '], "")
+                    .to_lowercase(),
+            });
             if active_key.is_none() {
                 active_key = keys.last().map(|k| k.name.clone());
             }
@@ -914,8 +1200,7 @@ impl App {
         if reload_archive {
             // reopen the most recent archive with the (possibly new) active key
             if let Some(rec) = self.recent.first().cloned() {
-                let path = std::path::PathBuf::from(&rec);
-                self.open_path(path);
+                self.open_path(std::path::PathBuf::from(&rec));
             }
         }
     }
@@ -931,51 +1216,86 @@ impl App {
         let mut process = false;
         let mut remove_idx: Option<usize> = None;
 
-        egui::Window::new(RichText::new(format!("{} Export Settings", ic::SETTINGS)).heading().strong())
-            .open(&mut open)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.label(RichText::new("Destination").strong());
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut output_dir)
-                            .desired_width(340.0)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    browse = ui.button("Browse…").clicked();
-                });
-                ui.separator();
-                ui.label(RichText::new("Export formats").strong());
-                egui::Grid::new("formats").num_columns(2).show(ui, |ui| {
-                    ui.checkbox(&mut formats.png, format!("Textures {} PNG (decoded)", arrow_right()));
-                    ui.checkbox(&mut formats.dds, format!("Textures {} DDS (original compression)", arrow_right()));
-                    ui.end_row();
-                    ui.checkbox(&mut formats.glb, format!("Meshes {} GLTF 2.0 (.glb)", arrow_right()));
-                    ui.checkbox(&mut formats.obj, format!("Meshes {} OBJ (fallback)", arrow_right()));
-                    ui.end_row();
-                    ui.checkbox(&mut formats.json, format!("Metadata {} JSON", arrow_right()));
-                    ui.checkbox(&mut formats.audio, format!("Audio {} WAV / OGG", arrow_right()));
-                    ui.end_row();
-                });
-                ui.separator();
-                ui.checkbox(&mut convert, format!("{} Enable conversion on extract", ic::ROCKET));
-                ui.separator();
-                ui.label(RichText::new("Batch queue").strong());
-                for (i, item) in queue.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}. {}", i + 1, file_name(item)));
-                        if ui.small_button(RichText::new(ic::CLOSE).size(11.0)).clicked() {
-                            remove_idx = Some(i);
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    add_current = ui.button(format!("{} Add current archive", ic::PLUS)).clicked();
-                    process = ui
-                        .add_enabled(!queue.is_empty(), egui::Button::new(format!("{} Process next", ic::PLAY)))
-                        .clicked();
-                });
+        egui::Window::new(
+            RichText::new(format!("{} Export Settings", ic::SETTINGS))
+                .heading()
+                .strong(),
+        )
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("DESTINATION")
+                    .size(10.5)
+                    .strong()
+                    .color(Palette::TEXT_FAINT),
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut output_dir)
+                        .desired_width(ui.available_width() - 74.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                browse = ui.button("Browse…").clicked();
             });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(
+                RichText::new("EXPORT FORMATS")
+                    .size(10.5)
+                    .strong()
+                    .color(Palette::TEXT_FAINT),
+            );
+            ui.add_space(2.0);
+            egui::Grid::new("formats").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
+                ui.checkbox(&mut formats.png, format!("Textures {} PNG (decoded)", ic::ARROW_RIGHT));
+                ui.checkbox(&mut formats.dds, format!("Textures {} DDS (original compression)", ic::ARROW_RIGHT));
+                ui.end_row();
+                ui.checkbox(&mut formats.glb, format!("Meshes {} GLTF 2.0 (.glb)", ic::ARROW_RIGHT));
+                ui.checkbox(&mut formats.obj, format!("Meshes {} OBJ (fallback)", ic::ARROW_RIGHT));
+                ui.end_row();
+                ui.checkbox(&mut formats.json, format!("Metadata {} JSON", ic::ARROW_RIGHT));
+                ui.checkbox(&mut formats.audio, format!("Audio {} WAV / OGG", ic::ARROW_RIGHT));
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.checkbox(&mut convert, "Enable conversion on extract");
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(
+                RichText::new("BATCH QUEUE")
+                    .size(10.5)
+                    .strong()
+                    .color(Palette::TEXT_FAINT),
+            );
+            if queue.is_empty() {
+                ui.label(
+                    RichText::new("Empty — add archives to process them one after another.")
+                        .size(12.0)
+                        .color(Palette::TEXT_FAINT),
+                );
+            }
+            for (i, item) in queue.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}. {}", i + 1, file_name(item)))
+                            .size(12.0),
+                    );
+                    if ui.small_button(RichText::new(ic::CLOSE).size(10.0)).clicked() {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                add_current = ui.button(format!("{} Add current", ic::PLUS)).clicked();
+                process = ui
+                    .add_enabled(!queue.is_empty(), egui::Button::new(format!("{} Process next", ic::PLAY)))
+                    .clicked();
+            });
+        });
 
         if browse {
             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -1022,15 +1342,25 @@ impl App {
                 RichText::new(
                     "Most failures are encrypted files without a valid key, or damaged archives.",
                 )
+                .size(12.0)
                 .color(Palette::TEXT_WEAK),
             );
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 if self.last_errors.is_empty() {
-                    ui.label("No errors recorded.");
+                    ui.label(
+                        RichText::new("No errors recorded.")
+                            .size(12.0)
+                            .color(Palette::TEXT_FAINT),
+                    );
                 }
                 for (i, e) in self.last_errors.iter().enumerate() {
-                    ui.label(RichText::new(format!("{}. {e}", i + 1)).monospace().small().color(Palette::TEXT));
+                    ui.label(
+                        RichText::new(format!("{}. {e}", i + 1))
+                            .monospace()
+                            .size(10.5)
+                            .color(Palette::TEXT),
+                    );
                     ui.add_space(2.0);
                 }
             });
@@ -1137,20 +1467,47 @@ impl App {
 // ---------------------------------------------------------------------------
 // small ui helpers
 
-fn icon_button(ui: &mut egui::Ui, glyph: &str, label: &str, tip: &str) -> egui::Response {
-    ui.button(RichText::new(format!("{glyph} {label}")).size(14.0))
+fn icon_button(ui: &mut egui::Ui, glyph: &str, _label: &str, tip: &str) -> egui::Response {
+    ui.button(RichText::new(glyph).size(15.0).color(Palette::TEXT_WEAK))
         .on_hover_text(tip)
 }
 
+/// Flat, professional table header cell: small caps text + caret when active.
+/// Returns the cell's click response.
+fn sort_header(ui: &mut egui::Ui, label: &str, active: bool, asc: bool, right_align: bool) -> egui::Response {
+    let text = label.to_uppercase();
+    let color = if active { Palette::ACCENT_TEXT } else { Palette::TEXT_FAINT };
+    let caret = if !active {
+        ""
+    } else if asc {
+        ic::CARET_UP
+    } else {
+        ic::CARET_DOWN
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 16.0),
+        Sense::click(),
+    );
+    let galley_text = format!("{text} {caret}");
+    let font = FontId::proportional(10.5);
+    let anchor = if right_align { Align2::RIGHT_CENTER } else { Align2::LEFT_CENTER };
+    let pos = if right_align { rect.right_center() } else { rect.left_center() };
+    ui.painter().text(pos, anchor, galley_text, font, color);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 fn meta_row(ui: &mut egui::Ui, k: &str, v: String) {
-    ui.label(RichText::new(k).small().color(Palette::TEXT_FAINT));
-    ui.label(RichText::new(v).small().color(Palette::TEXT));
+    ui.label(RichText::new(k).size(11.0).color(Palette::TEXT_FAINT));
+    ui.label(RichText::new(v).size(12.0).color(Palette::TEXT));
     ui.end_row();
 }
 
 fn prog_row(ui: &mut egui::Ui, k: &str, v: String) {
-    ui.label(RichText::new(k).small().color(Palette::TEXT_FAINT));
-    ui.label(RichText::new(v).small().color(Palette::TEXT));
+    ui.label(RichText::new(k).size(11.0).color(Palette::TEXT_FAINT));
+    ui.label(RichText::new(v).size(12.0).color(Palette::TEXT));
     ui.end_row();
 }
 
@@ -1166,12 +1523,13 @@ fn render_tree_nodes(
         let has_children = !node.children.is_empty();
         if has_children {
             let open = expanded.contains(&node.full_path);
+            let caret = if open { ic::CARET_DOWN } else { ic::CARET_RIGHT };
             let glyph = if open { ic::FOLDER_OPEN } else { ic::FOLDER };
             let resp = ui.selectable_label(
                 false,
-                RichText::new(format!("{glyph} {}", node.name))
-                    .size(13.5)
-                    .color(Palette::ACCENT_TEXT),
+                RichText::new(format!("{caret} {glyph} {}", node.name))
+                    .size(12.5)
+                    .color(Palette::TEXT),
             );
             if resp.clicked() {
                 *to_toggle = Some(node.full_path.clone());
@@ -1188,9 +1546,10 @@ fn render_tree_nodes(
                 .selectable_label(
                     selected,
                     RichText::new(format!("{icon} {}", node.name))
-                        .size(13.0)
+                        .size(12.5)
                         .color(if selected { Palette::ACCENT_TEXT } else { Palette::TEXT }),
                 )
+                .on_hover_text(&node.full_path)
                 .clicked()
             {
                 *to_select = node.file.clone();
@@ -1205,9 +1564,9 @@ trait UiCaptionExt {
 
 impl UiCaptionExt for egui::Ui {
     fn caption(&mut self, text: &str) {
-        self.label(RichText::new(text).small().color(Color32::from_rgb(0x9a, 0xa0, 0xb0)));
+        self.label(RichText::new(text).size(10.5).color(Palette::TEXT_FAINT));
     }
 }
 
-// referenced helper so `ic::TREE` etc stay private-friendly
-pub(crate) fn _noop() {}
+
+
