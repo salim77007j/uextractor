@@ -57,7 +57,7 @@ parallel across all CPU cores, and converts game assets into industry-standard f
 
 ```sh
 # inspect an archive
-uex infopakchunk0-WindowsNoEditor.pak
+uex info pakchunk0-WindowsNoEditor.pak
 
 # list contents
 uex list pakchunk0-WindowsNoEditor.pak --filter textures
@@ -74,6 +74,17 @@ uex extract Game.pak -k 0x0123456789ABCDEF... --convert auto --out out
 # IOStore containers (UE5)
 uex list global.utoc
 uex extract . --convert auto --out out        # directory mode: mounts all paks+utocs
+
+# Unity AssetBundle / serialized files (auto-detected)
+uex list char_118_yuki.ab
+uex extract data.unity3d --convert auto --out out
+
+# Unity encrypted (UnityCN) — key is the 16-char "statistic" key
+uex test-key GameBundle.ab -k YourUnityCNKey!
+uex extract GameBundle.ab -k YourUnityCNKey! --convert auto --out out
+
+# no test game handy? generate byte-exact synthetic archives (UE + Unity)
+uex gen-testdata --out testdata --unity
 ```
 
 Exit codes: `0` success · `1` runtime error · `2` usage error. `--format json` gives
@@ -87,8 +98,20 @@ uex-gui
 
 Dark-themed professional UI: archive tree browser, asset list/grid, live previews
 (decoded textures, software-rendered 3D mesh viewport with drag-rotate), batch
-extraction queue with progress/speed/ETA, AES key manager, export settings,
-drag-and-drop, recent archives.
+extraction queue with progress/speed/ETA/cancel, AES key manager, export settings,
+drag-and-drop, recent archives. Encrypted archives raise a **key prompt before any
+extraction is attempted** — no more cryptic decompression errors.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![UE browser](docs/screenshots/01_ue_browser.png) | ![UE texture preview](docs/screenshots/02_ue_texture_preview.png) |
+| ![Unity browser](docs/screenshots/03_unity_browser.png) | ![Unity texture preview](docs/screenshots/04_unity_texture_preview.png) |
+| ![Extraction progress](docs/screenshots/05_extraction_progress.png) | ![AES key prompt](docs/screenshots/07_aes_key_required_prompt.png) |
+
+All screenshots are captured from the real application (autoshot mode drives the actual
+UI under Xvfb and grabs the X11 framebuffer) — no mockups.
 
 ## Building
 
@@ -106,13 +129,15 @@ tool still fully supports Zlib/Gzip/LZ4/Zstd archives.
 
 ```sh
 cargo test --workspace
-uex gen-testdata --out testdata   # byte-exact synthetic archives (PAK v11, encrypted, IOStore v5)
+uex gen-testdata --out testdata --unity   # byte-exact synthetic archives (PAK v11, encrypted, IOStore v5, UnityFS, .assets)
 uex bench --size-mb 512 --compression oodle
 ```
 
-The test suite builds synthetic PAK/IOStore archives from scratch and round-trips them
-through the real parser — covering all compression methods, AES-encrypted indices and
-entries, multi-block entries, zen package headers, name maps, and asset conversion.
+The test suite builds synthetic PAK/IOStore/Unity archives from scratch and round-trips
+them through the real parsers — covering all compression methods, AES-encrypted indices
+and entries, multi-block entries, zen package headers, name maps, asset conversion, and
+Unity bundles/serialized files/typetrees. Unity results were cross-validated against
+UnityPy (reference implementation): byte-identical textures and audio on real game data.
 
 ## Performance
 
@@ -121,15 +146,17 @@ Measured on a 2-core cloud VM (hypervisor-limited; scales further on real hardwa
 | Workload | Throughput |
 |---|---|
 | Oodle decompression (Kraken payload) | ~1.7 GB/s |
-| LZ4 extraction | ~1.3 GB/s |
+| LZ4 extraction | ~0.9–1.3 GB/s |
 | Zlib extraction | ~0.43 GB/s |
+| AES-256 encrypted extraction | ~0.35 GB/s |
 | Memory (1 GB archive) | **10 MB peak RSS** |
 
 ## Architecture
 
 ```
-uex-core     archive parsers (PAK/IOStore), crypto, compression, uasset/uexp/uubulk,
-             property serialization (versioned + unversioned), converters, exporters
+uex-core     archive parsers (PAK/IOStore + Unity bundles/serialized files), crypto,
+             compression, uasset/uexp/uubulk, property serialization (versioned +
+             unversioned), typetrees + TPK database, converters, exporters
 uex-cli      full CLI (info/list/extract/bench/test-key/gen-testdata)
 uex-gui      eframe/egui desktop app (tree, previews, 3D viewport, queue, key manager)
 uex-testdata synthetic archive builders used by the test suite
